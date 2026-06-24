@@ -21,6 +21,8 @@
 #define FIXED_BUFFER_SAMPLES 1024
 #define FIXED_BUFFER_BYTES   (FIXED_BUFFER_SAMPLES * 4) // 4096 bytes (4KB)
 
+#define SMI_SAMPLE_RATE_HZ   2500000 // 2.5 MHz
+
 
 int main() {
     printf("--- SMI & DMA Manager initialized ---\n");
@@ -68,15 +70,13 @@ int main() {
     }
     volatile uint32_t *dma_chan5 = dma_base_map + (0x500 / 4);
 
-    uint32_t sample_rate_hz = 25000000; // 2.5 MHz for testing
-
     // 6. Execute coordinated capture
-    printf("Arming DMA and triggering SMI at %d Hz...\n", sample_rate_hz);
+    printf("Arming DMA and triggering SMI at %d Hz...\n", SMI_SAMPLE_RATE_HZ);
     
     start_dma_channel(dma_chan5, cb_buf.bus_addr);
     
     // Pass the sample rate directly to the HAL
-    smi_start_capture(&smi_hw, FIXED_BUFFER_SAMPLES, sample_rate_hz);
+    smi_start_capture(&smi_hw, FIXED_BUFFER_SAMPLES, SMI_SAMPLE_RATE_HZ);
 
     // 7. Wait for completion (Simple blocking wait for this iteration)
     int timeout = 500000;
