@@ -9,14 +9,21 @@
 #define CM_BASE              (BCM2711_PERI_BASE + 0x101000) 
 #define GPIO_BASE            (BCM2711_PERI_BASE + 0x200000)
 
-// TRUE Register offsets
+// --- SMI Register offsets ---
 #define SMI_CS_REG           0x00 
 #define SMI_L_REG            0x04 
 #define SMI_A_REG            0x08 
 #define SMI_D_REG            0x0C 
-#define SMI_DSR0_REG         0x10  // Read timing for Device 0
-#define SMI_DSW0_REG         0x14  // Write timing for Device 0
-#define SMI_DMC_REG          0x30  // DMA Control Register
+#define SMI_DSR0_REG         0x10  
+#define SMI_DSW0_REG         0x14  
+#define SMI_DMC_REG          0x30  
+
+// --- Clock Manager (CM) & GPIO Register offsets (RESTORED) ---
+#define CM_SMICTL            0xB0
+#define CM_SMIDIV            0xB4
+#define CM_PASSWD            0x5A000000 
+#define GPFSEL0              0x00 
+#define GPPUPPDN0            0x39 
 
 // SMI Control Bits (SMI_CS_REG)
 #define SMI_CS_ENABLE        (1 << 0)
@@ -24,18 +31,19 @@
 #define SMI_CS_CLEAR         (1 << 4)  
 
 // SMI DMA Control Bits (SMI_DMC_REG)
-#define SMI_DMC_DMAEN        (1 << 28) // Enable DMA generation
+#define SMI_DMC_DMAEN        (1 << 28) 
 #define SMI_DMC_PANICR_SHIFT 18
 #define SMI_DMC_REQR_SHIFT   6
-#define SMI_DMC_REQR_1       (1 << SMI_DMC_REQR_SHIFT)   // Trigger DREQ when 1 word is ready
-#define SMI_DMC_PANICR_1     (1 << SMI_DMC_PANICR_SHIFT) // Panic when 1 word is ready
+#define SMI_DMC_REQR_1       (1 << SMI_DMC_REQR_SHIFT)   
+#define SMI_DMC_PANICR_1     (1 << SMI_DMC_PANICR_SHIFT) 
 
-// True Timing Register Shifts (SMI_DSR0_REG)
+// Timing Register Shifts (SMI_DSR0_REG)
 #define SMI_DSR_SETUP_SHIFT  28
 #define SMI_DSR_STROBE_SHIFT 14
 #define SMI_DSR_HOLD_SHIFT   7
 #define SMI_DSR_PACE_SHIFT   0
 
+// Hardware Constraints
 #define SMI_SOURCE_CLOCK_HZ  500000000 
 #define SMI_MAX_DIVISOR      32        
 #define SMI_MAX_TOTAL_CYCLES 252       
@@ -89,7 +97,6 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     uint32_t pace = total_cycles - setup - strobe - hold;
     if (pace == 0) pace = 1;
     
-    // Boundary checks for the actual bit-widths of the hardware
     if (setup > 63) setup = 63;
     if (strobe > 127) strobe = 127;
     if (hold > 63) hold = 63;
@@ -107,7 +114,6 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     hw->smi[SMI_CS_REG / 4] = SMI_CS_ENABLE | SMI_CS_CLEAR;
     usleep(10);
     
-    // CRITICAL FIX: Write timing to the correct DSR0 register with proper bit shifts
     hw->smi[SMI_DSR0_REG / 4] = (setup << SMI_DSR_SETUP_SHIFT) | 
                                 (strobe << SMI_DSR_STROBE_SHIFT) | 
                                 (hold << SMI_DSR_HOLD_SHIFT) | 
@@ -130,7 +136,7 @@ void smi_stop_capture(SmiHardware* hw) {
     hw->gpio[GPFSEL0] &= ~((GPIO_FUNC_MASK << 24) | (GPIO_FUNC_MASK << 27));
 
     hw->smi[SMI_CS_REG / 4] = 0;
-    hw->smi[SMI_DMC_REG / 4] = 0; // Disable DMA Requests
+    hw->smi[SMI_DMC_REG / 4] = 0; 
 }
 
 void smi_cleanup(SmiHardware* hw) {
