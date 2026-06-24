@@ -60,15 +60,21 @@ int main() {
         return -1;
     }
 
-    volatile uint32_t* dma_chan5 = mmap(
-        NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, DMA_CH5_BASE
+    // CRITICAL FIX: mmap requires a page-aligned physical address (multiple of 0x1000).
+    // DMA_BASE is 0xFE007000 (Aligned). DMA_CH5_BASE is 0xFE007500 (Not aligned).
+    volatile uint32_t* dma_base_map = mmap(
+        NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, DMA_BASE
     );
 
-    if (dma_chan5 == MAP_FAILED) {
+    if (dma_base_map == MAP_FAILED) {
         printf("FAIL: Failed to map DMA registers.\n");
         close(mem_fd);
         return -1;
     }
+
+    // Offset the pointer manually by 0x500 bytes to reach Channel 5.
+    // Since dma_base_map is a 32-bit pointer (4 bytes), we divide the offset by 4.
+    volatile uint32_t* dma_chan5 = dma_base_map + (0x500 / 4);
 
     // 5. Execute DMA Transfer
     printf("Starting DMA engine...\n");
@@ -76,7 +82,7 @@ int main() {
 
     // 6. Wait for Completion
     int timeout = 100000;
-    while (!is_dma_transfer_complete(dma_chan5)) {
+    while (!is_dma_transfer_complsete(dma_chan5)) {
         timeout--;
         if (timeout == 0) {
             printf("FAIL: DMA Timeout! Engine hung.\n");
