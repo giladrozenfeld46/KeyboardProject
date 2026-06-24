@@ -16,7 +16,7 @@
 // Bit 4: Destination Address Increment
 #define DMA_TI_MEMCPY     ((1 << 8) | (1 << 4))
 
-#define TEST_BUFFER_SIZE  256 // Bytes to copy
+#define TEST_BUFFER_SIZE  4095 // Bytes to copy
 
 int main() {
     DmaBuffer src_buf, dest_buf, cb_buf;
@@ -32,10 +32,13 @@ int main() {
     }
     if (allocate_dma_buffer(&dest_buf, TEST_BUFFER_SIZE) != 0) {
         printf("FAIL: Could not allocate destination buffer.\n");
+        free_dma_buffer(&src_buf);
         return -1;
     }
     if (allocate_dma_buffer(&cb_buf, sizeof(struct DmaControlBlock)) != 0) {
         printf("FAIL: Could not allocate Control Block buffer.\n");
+        free_dma_buffer(&src_buf);
+        free_dma_buffer(&dest_buf);
         return -1;
     }
 
@@ -57,6 +60,9 @@ int main() {
     int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (mem_fd < 0) {
         printf("FAIL: Cannot open /dev/mem. Are you running with sudo?\n");
+        free_dma_buffer(&src_buf);
+        free_dma_buffer(&dest_buf);
+        free_dma_buffer(&cb_buf);
         return -1;
     }
 
@@ -68,6 +74,9 @@ int main() {
 
     if (dma_base_map == MAP_FAILED) {
         printf("FAIL: Failed to map DMA registers.\n");
+        free_dma_buffer(&src_buf);
+        free_dma_buffer(&dest_buf);
+        free_dma_buffer(&cb_buf);
         close(mem_fd);
         return -1;
     }
@@ -82,7 +91,7 @@ int main() {
 
     // 6. Wait for Completion
     int timeout = 100000;
-    while (!is_dma_transfer_complsete(dma_chan5)) {
+    while (!is_dma_transfer_complete(dma_chan5)) {
         timeout--;
         if (timeout == 0) {
             printf("FAIL: DMA Timeout! Engine hung.\n");
