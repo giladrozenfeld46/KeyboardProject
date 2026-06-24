@@ -57,6 +57,7 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     // 1. Prepare GPIO as safe High-Z input
     hw->gpio[GPFSEL0] &= ~((GPIO_FUNC_MASK << 24) | (GPIO_FUNC_MASK << 27));
     hw->gpio[GPPUPPDN0] &= ~((GPIO_PUPD_MASK << 16) | (GPIO_PUPD_MASK << 18));
+    
 
     // --- DYNAMIC FREQUENCY CALCULATION ---
     uint32_t clock_divisor = 2; // Start with a safe default divisor
@@ -113,6 +114,18 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     // 5. Start Capture
     hw->smi[SMI_DCS_REG / 4] = SMI_DCS_ENABLE;
     hw->smi[SMI_CS_REG / 4] = SMI_CS_ENABLE | SMI_CS_START;
+}
+
+void smi_stop_capture(SmiHardware* hw) {
+    if (!hw || !hw->gpio || !hw->smi) return;
+
+    // CRITICAL FIX: Immediately revert pins to standard High-Z Input
+    // This removes the SMI hardware from the bus and stops it from driving 0V.
+    hw->gpio[GPFSEL0] &= ~((GPIO_FUNC_MASK << 24) | (GPIO_FUNC_MASK << 27));
+
+    // Shut down the SMI engine
+    hw->smi[SMI_CS_REG / 4] = 0;
+    hw->smi[SMI_DCS_REG / 4] = 0;
 }
 
 void smi_cleanup(SmiHardware* hw) {

@@ -19,6 +19,9 @@ int smi_init(SmiHardware* hw, int mem_fd);
 // Safely configures pins, sets the dynamic sampling rate, and starts capture
 void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz);
 
+// IMMEDIATELY releases the pins to High-Z to prevent bus contention
+void smi_stop_capture(SmiHardware* hw);
+
 // Safely disables SMI and returns pins to safe High-Z input state.
 // Also unmaps the hardware registers.
 void smi_cleanup(SmiHardware* hw);
