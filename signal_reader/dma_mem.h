@@ -1,44 +1,23 @@
-#ifndef DMA_MEMORY_ALOCATOR_H
-#define DMA_MEMORY_ALOCATOR_H
+#ifndef DMA_MEM_H
+#define DMA_MEM_H
 
-/* includes */
-#include <stdio.h>
+#include <stddef.h>
 #include <stdint.h>
-#include <stdlib.h>
-#include <fcntl.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <unistd.h>
 
-/* macros */
-// VideoCore Mailbox interface path
-#define DEVICE_FILE_NAME "/dev/vcio"
-#define MAJOR_NUM 100
-#define IOCTL_MBOX_PROPERTY _IOWR(MAJOR_NUM, 0, char *)
-
-// Mailbox tags for memory allocation
-#define MEM_ALLOC_TAG 0x3000C
-#define MEM_LOCK_TAG  0x3000D
-#define MEM_FREE_TAG  0x3000F
-#define MEM_UNLOCK_TAG 0x3000E
-
-// Direct Uncached memory flag (Required for DMA on Pi 4)
-#define MEM_FLAG_DIRECT (1 << 2) | (1 << 3)
-#define PAGE_SIZE 4096
-
-
-/* types */
-// Struct to hold the allocated memory details
+// Structure to encapsulate all attributes of a contiguous DMA buffer
 typedef struct {
-    uint32_t handle;       // GPU reference handle
-    uint32_t bus_addr;     // Address to give to the DMA
-    uint32_t phys_addr;    // Address to map in /dev/mem
-    void* virtual_addr;    // Pointer for your C code to read/write
-    size_t size;
+    uint32_t handle;       // GPU memory handle reference
+    uint32_t bus_addr;     // Bus address as seen by the DMA controller
+    uint32_t phys_addr;    // Physical address used for memory mapping
+    void* virtual_addr;    // Virtual address pointer used by the CPU
+    size_t size;           // Total allocated size (aligned to page size)
 } DmaBuffer;
 
-/* function declarations */
+// Allocates contiguous, uncached memory via VideoCore Mailbox
+// Returns 0 on success, -1 on failure
 int allocate_dma_buffer(DmaBuffer* buf, size_t size);
 
+// Unmaps and releases the allocated memory back to the GPU
+void free_dma_buffer(DmaBuffer* buf);
 
-#endif /* DMA_MEMORY_ALOCATOR_H */
+#endif // DMA_MEM_H
