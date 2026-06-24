@@ -9,35 +9,41 @@
 #define CM_BASE              (BCM2711_PERI_BASE + 0x101000) 
 #define GPIO_BASE            (BCM2711_PERI_BASE + 0x200000)
 
-// Register offsets
+// TRUE Register offsets
 #define SMI_CS_REG           0x00 
 #define SMI_L_REG            0x04 
 #define SMI_A_REG            0x08 
-#define SMI_DCS_REG          0x10 
-#define SMI_SR0_REG          0x20 
-#define CM_SMICTL            0xB0
-#define CM_SMIDIV            0xB4
-#define CM_PASSWD            0x5A000000 
-#define GPFSEL0              0x00 
-#define GPPUPPDN0            0x39 
+#define SMI_D_REG            0x0C 
+#define SMI_DSR0_REG         0x10  // Read timing for Device 0
+#define SMI_DSW0_REG         0x14  // Write timing for Device 0
+#define SMI_DMC_REG          0x30  // DMA Control Register
 
-// SMI Control Bits
+// SMI Control Bits (SMI_CS_REG)
 #define SMI_CS_ENABLE        (1 << 0)
 #define SMI_CS_START         (1 << 3)  
 #define SMI_CS_CLEAR         (1 << 4)  
-#define SMI_DCS_ENABLE       (1 << 0) 
 
-// --- NEW: Descriptive Hardware Constraints ---
-#define SMI_SOURCE_CLOCK_HZ  500000000 // 500 MHz PLLD clock source
-#define SMI_MAX_DIVISOR      32        // Maximum integer divisor for the clock
-#define SMI_MAX_STAGE_CYCLES 63        // Hardware limit: 6 bits per timing stage
-#define SMI_NUM_STAGES       4         // Setup, Strobe, Hold, Pace
-#define SMI_MAX_TOTAL_CYCLES (SMI_MAX_STAGE_CYCLES * SMI_NUM_STAGES) // 252 cycles
-#define SMI_MIN_TOTAL_CYCLES 4         // Minimum 1 cycle per stage
+// SMI DMA Control Bits (SMI_DMC_REG)
+#define SMI_DMC_DMAEN        (1 << 28) // Enable DMA generation
+#define SMI_DMC_PANICR_SHIFT 18
+#define SMI_DMC_REQR_SHIFT   6
+#define SMI_DMC_REQR_1       (1 << SMI_DMC_REQR_SHIFT)   // Trigger DREQ when 1 word is ready
+#define SMI_DMC_PANICR_1     (1 << SMI_DMC_PANICR_SHIFT) // Panic when 1 word is ready
 
-#define GPIO_FUNC_MASK       7         // 3 bits to clear GPIO function (111 in binary)
-#define GPIO_FUNC_ALT1       5         // ALT1 function code for SMI
-#define GPIO_PUPD_MASK       3         // 2 bits to clear Pull-Up/Down (11 in binary)
+// True Timing Register Shifts (SMI_DSR0_REG)
+#define SMI_DSR_SETUP_SHIFT  28
+#define SMI_DSR_STROBE_SHIFT 14
+#define SMI_DSR_HOLD_SHIFT   7
+#define SMI_DSR_PACE_SHIFT   0
+
+#define SMI_SOURCE_CLOCK_HZ  500000000 
+#define SMI_MAX_DIVISOR      32        
+#define SMI_MAX_TOTAL_CYCLES 252       
+#define SMI_MIN_TOTAL_CYCLES 4         
+
+#define GPIO_FUNC_MASK       7         
+#define GPIO_FUNC_ALT1       5         
+#define GPIO_PUPD_MASK       3         
 
 
 int smi_init(SmiHardware* hw, int mem_fd) {
@@ -54,32 +60,24 @@ int smi_init(SmiHardware* hw, int mem_fd) {
 void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz) {
     if (!hw || !hw->smi || !hw->cm || !hw->gpio) return;
 
-    // 1. Prepare GPIO as safe High-Z input
+    // 1. Prepare GPIO as safe High-Z input FIRST
     hw->gpio[GPFSEL0] &= ~((GPIO_FUNC_MASK << 24) | (GPIO_FUNC_MASK << 27));
     hw->gpio[GPPUPPDN0] &= ~((GPIO_PUPD_MASK << 16) | (GPIO_PUPD_MASK << 18));
-    
 
-    // --- DYNAMIC FREQUENCY CALCULATION ---
-    uint32_t clock_divisor = 2; // Start with a safe default divisor
-    
+    // 2. Dynamic Clock Calculation
+    uint32_t clock_divisor = 2; 
     uint32_t base_clock = SMI_SOURCE_CLOCK_HZ / clock_divisor;
     uint32_t total_cycles = base_clock / target_hz;
 
-    // Apply hardware boundaries
-    if (total_cycles < SMI_MIN_TOTAL_CYCLES) {
-        total_cycles = SMI_MIN_TOTAL_CYCLES;
-    }
+    if (total_cycles < SMI_MIN_TOTAL_CYCLES) total_cycles = SMI_MIN_TOTAL_CYCLES;
     
     if (total_cycles > SMI_MAX_TOTAL_CYCLES) {
-        clock_divisor = total_cycles / SMI_MAX_STAGE_CYCLES;
-        if (clock_divisor > SMI_MAX_DIVISOR) {
-            clock_divisor = SMI_MAX_DIVISOR;
-        }
+        clock_divisor = total_cycles / 63;
+        if (clock_divisor > SMI_MAX_DIVISOR) clock_divisor = SMI_MAX_DIVISOR;
         base_clock = SMI_SOURCE_CLOCK_HZ / clock_divisor;
         total_cycles = base_clock / target_hz;
     }
 
-    // Distribute cycles (10% Setup, 50% Strobe, 20% Hold, 20% Pace)
     uint32_t setup  = (total_cycles * 1) / 10;
     uint32_t strobe = (total_cycles * 5) / 10;
     uint32_t hold   = (total_cycles * 2) / 10;
@@ -90,9 +88,14 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
 
     uint32_t pace = total_cycles - setup - strobe - hold;
     if (pace == 0) pace = 1;
-    if (pace > SMI_MAX_STAGE_CYCLES) pace = SMI_MAX_STAGE_CYCLES;
+    
+    // Boundary checks for the actual bit-widths of the hardware
+    if (setup > 63) setup = 63;
+    if (strobe > 127) strobe = 127;
+    if (hold > 63) hold = 63;
+    if (pace > 127) pace = 127;
 
-    // 2. Configure Hardware Clock
+    // 3. Configure Hardware Clock
     hw->cm[CM_SMICTL / 4] = CM_PASSWD | (0 << 4); 
     usleep(10);
     hw->cm[CM_SMIDIV / 4] = CM_PASSWD | (clock_divisor << 12); 
@@ -100,38 +103,41 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     hw->cm[CM_SMICTL / 4] = CM_PASSWD | 1 | (1 << 4); 
     usleep(10);
 
-    // 3. Initialize SMI timing and buffers
+    // 4. Initialize SMI timing and buffers
     hw->smi[SMI_CS_REG / 4] = SMI_CS_ENABLE | SMI_CS_CLEAR;
     usleep(10);
     
-    hw->smi[SMI_SR0_REG / 4] = (setup << 24) | (strobe << 16) | (hold << 8) | pace; 
+    // CRITICAL FIX: Write timing to the correct DSR0 register with proper bit shifts
+    hw->smi[SMI_DSR0_REG / 4] = (setup << SMI_DSR_SETUP_SHIFT) | 
+                                (strobe << SMI_DSR_STROBE_SHIFT) | 
+                                (hold << SMI_DSR_HOLD_SHIFT) | 
+                                (pace << SMI_DSR_PACE_SHIFT); 
+                                
     hw->smi[SMI_L_REG / 4] = num_samples; 
     hw->smi[SMI_A_REG / 4] = 0;
 
-    // 4. Set GPIO to ALT1 for SMI
+    // 5. Set GPIO to ALT1 for SMI
     hw->gpio[GPFSEL0] |= ((GPIO_FUNC_ALT1 << 24) | (GPIO_FUNC_ALT1 << 27));
 
-    // 5. Start Capture
-    hw->smi[SMI_DCS_REG / 4] = SMI_DCS_ENABLE;
+    // 6. Start Capture and Enable DMA Request Generation
+    hw->smi[SMI_DMC_REG / 4] = SMI_DMC_DMAEN | SMI_DMC_REQR_1 | SMI_DMC_PANICR_1;
     hw->smi[SMI_CS_REG / 4] = SMI_CS_ENABLE | SMI_CS_START;
 }
 
 void smi_stop_capture(SmiHardware* hw) {
     if (!hw || !hw->gpio || !hw->smi) return;
 
-    // CRITICAL FIX: Immediately revert pins to standard High-Z Input
-    // This removes the SMI hardware from the bus and stops it from driving 0V.
     hw->gpio[GPFSEL0] &= ~((GPIO_FUNC_MASK << 24) | (GPIO_FUNC_MASK << 27));
 
-    // Shut down the SMI engine
     hw->smi[SMI_CS_REG / 4] = 0;
-    hw->smi[SMI_DCS_REG / 4] = 0;
+    hw->smi[SMI_DMC_REG / 4] = 0; // Disable DMA Requests
 }
 
 void smi_cleanup(SmiHardware* hw) {
     if (!hw) return;
-    if (hw->gpio != MAP_FAILED) hw->gpio[GPFSEL0] &= ~((GPIO_FUNC_MASK << 24) | (GPIO_FUNC_MASK << 27));
-    if (hw->smi != MAP_FAILED) hw->smi[SMI_CS_REG / 4] = 0;
+    
+    smi_stop_capture(hw);
+    
     if (hw->smi != MAP_FAILED) munmap((void*)hw->smi, 4096);
     if (hw->cm != MAP_FAILED) munmap((void*)hw->cm, 4096);
     if (hw->gpio != MAP_FAILED) munmap((void*)hw->gpio, 4096);
