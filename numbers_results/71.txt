@@ -1,0 +1,4 @@
+time: -0.000103s, size: 88, Data: {'PID': 'DATA1', 'DATA': '000000001E240000', 'CRC16': '0001001000010001', 'CRC_VALID': True}
+time: -0.000036s, size: 8, Data: {'PID': 'ACK'}
+time: -0.000022s, size: 24, Data: {'PID': 'IN', 'ADDR': 35, 'ENDP': '0010', 'CRC5': '11110', 'CRC_VALID': True}
+time: 0.000004s, size: 8, Data: {'PID': 'NAK'}

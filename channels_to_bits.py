@@ -6,243 +6,237 @@ import matplotlib
 matplotlib.use('TkAgg')
 
 
-def load_and_preprocess_csv(file_path):
-    """
-    Reads the CSV, cleans missing data, and truncates the timeline
-    to start exactly at the first rising edge of the first channel.
-    """
-    df = pd.read_csv(file_path, skiprows=1)
+# ===================================================================
+# HELPER CLASS: Allows attaching timestamps to a standard list object
+# ===================================================================
+class SymbolList(list):
+    def __init__(self, iterable, timestamps=None):
+        super().__init__(iterable)
+        self.timestamps = timestamps or []
 
-    time_col = [c for c in df.columns if 'Time' in str(c)][0]
-    channel_cols = [c for c in df.columns if 'VOLT' in str(c)]
+
+def decode_differential_symbols(ch1_bits, ch2_bits):
+    """
+    Takes two synchronized binary sequences and decodes them into symbols.
+    """
+    symbols = []
+    for b1, b2 in zip(ch1_bits, ch2_bits):
+        if b1 == 0 and b2 == 0:
+            symbols.append("SE0")
+        elif b1 == 1 and b2 == 0:
+            symbols.append("K")
+        elif b1 == 0 and b2 == 1:
+            symbols.append("J")
+        elif b1 == 1 and b2 == 1:
+            symbols.append("SE1")
+    return symbols
+
+
+def convert_packets_to_symbols(packets_dict, ch1_name, ch2_name):
+    """
+    Converts raw channel bits into decoded symbols.
+    Returns a SymbolList which acts like a normal list but holds corrected timestamps.
+    """
+    symbol_packets = {}
+
+    for start_time, channels_data in packets_dict.items():
+        if ch1_name in channels_data and ch2_name in channels_data:
+            ch1_bits = channels_data[ch1_name]
+            ch2_bits = channels_data[ch2_name]
+
+            symbols_list = decode_differential_symbols(ch1_bits, ch2_bits)
+
+            # Wrap the standard list in our custom class to attach the timestamps
+            symbol_packets[start_time] = SymbolList(
+                symbols_list,
+                timestamps=channels_data.get('timestamps', [])
+            )
+        else:
+            print(f"Warning: Missing channel data for packet starting at {start_time}")
+
+    return symbol_packets
+
+
+def extract_packets_from_csv(file_path):
+    """
+    Extracts packets using true Edge-Driven Clock Recovery.
+    Snaps to physical edges to completely eliminate clock drift.
+    """
+    bit_rate = 1500000.0
+    ideal_bit_duration = 1.0 / bit_rate
+
+    df = pd.read_csv(file_path, header=0, skiprows=[1])
+    time_col = df.columns[0]
+    ch1_col = df.columns[1]
+    ch2_col = df.columns[2]
+    channel_cols = [ch1_col, ch2_col]
 
     df = df.dropna(subset=[time_col] + channel_cols).reset_index(drop=True)
 
-    # Isolate first channel to find the starting point
-    first_ch = channel_cols[0]
-    volt_ch1 = df[first_ch].values
+    time_data = df[time_col].values
+    volt_ch1 = df[ch1_col].values
+    volt_ch2 = df[ch2_col].values
 
-    threshold_ch1 = (np.max(volt_ch1) + np.min(volt_ch1)) / 2.0
-    binary_ch1 = (volt_ch1 > threshold_ch1).astype(int)
+    thresh_ch1 = (np.max(volt_ch1) + np.min(volt_ch1)) / 2.0
+    thresh_ch2 = (np.max(volt_ch2) + np.min(volt_ch2)) / 2.0
 
-    # Find the first rising edge
-    rising_edges = np.where((binary_ch1[:-1] == 0) & (binary_ch1[1:] == 1))[0]
+    bin_ch1 = (volt_ch1 > thresh_ch1).astype(int)
+    bin_ch2 = (volt_ch2 > thresh_ch2).astype(int)
 
-    if len(rising_edges) > 0:
-        start_index = rising_edges[0] + 1
-    elif binary_ch1[0] == 1:
-        start_index = 0
-    else:
-        # Signal never goes high
-        return None, None
+    packets = {}
+    in_packet = False
 
-    # Truncate arrays to skip leading zeros
-    time_data = df[time_col].values[start_index:]
-    channel_data_dict = {ch: df[ch].values[start_index:] for ch in channel_cols}
+    start_time = 0.0
+    last_sync_time = 0.0
+    current_ch1 = 0
+    current_ch2 = 0
 
-    return time_data, channel_data_dict
+    ch1_bits = []
+    ch2_bits = []
+    timestamps = []
 
-
-def estimate_bit_duration(time_data, binary_signal):
-    """
-    Analyzes the signal to find where it transitions between 0 and 1,
-    and estimates the exact time duration of a single bit.
-    """
-    # Find all indices where the signal flips its state
-    transitions = np.where(np.diff(binary_signal) != 0)[0]
-
-    if len(transitions) < 2:
-        # Not enough data to determine a bit duration
-        return None, None
-
-    transition_times = time_data[transitions]
-
-    # Calculate the time differences (dt) between consecutive transitions
-    dt = np.diff(transition_times)
-
-    # Filter out hardware noise (e.g., tiny spikes shorter than 10ns)
-    valid_dt = dt[dt > 1e-8]
-    if len(valid_dt) == 0:
-        return None, None
-
-    # Find the shortest legitimate interval, which represents a single bit.
-    # We take the median of intervals close to the minimum to avoid outlier distortion.
-    min_dt = np.min(valid_dt)
-    base_bit_duration = np.median(valid_dt[valid_dt < 1.5 * min_dt])
-
-    return base_bit_duration, transitions
-
-
-def build_voltage_intervals(time_data, binary_signal, transitions):
-    """
-    Maps the continuous binary signal into discrete, stable intervals.
-    Returns a list of tuples in the format: (start_time, end_time, logic_state).
-    """
-    transition_times = time_data[transitions]
-    intervals = []
-
-    # 1. Handle the leading period (from start of recording to first transition)
-    if transition_times[0] > time_data[0]:
-        intervals.append((time_data[0], transition_times[0], binary_signal[0]))
-
-    # 2. Handle all stable periods between the first and last transition
-    for i in range(len(transitions) - 1):
-        start_t = transition_times[i]
-        end_t = transition_times[i + 1]
-
-        # The state is sampled exactly one index after the transition occurred
-        state = binary_signal[transitions[i] + 1]
-        intervals.append((start_t, end_t, state))
-
-    # 3. Handle the trailing period (from last transition to end of recording)
-    if time_data[-1] > transition_times[-1]:
-        intervals.append((transition_times[-1], time_data[-1], binary_signal[-1]))
-
-    return intervals
-
-
-def compute_bit_coordinates(time_data, volt_data, intervals, base_bit_duration):
-    """
-    Slices the stable intervals into individual bits based on the base duration.
-    Calculates exact coordinates for visualization (boundaries and text centers).
-    """
-    boundary_times, boundary_volts = [], []
-    bit_centers_x, bit_centers_y = [], []
-    bits = []
-
-    for start_t, end_t, state in intervals:
-        duration = end_t - start_t
-
-        # Determine how many whole bits fit into this specific interval
-        num_bits = int(np.round(duration / base_bit_duration))
-
-        if num_bits > 0:
-            # Localize bit duration: divide the exact interval length by num_bits.
-            # This perfectly aligns bits inside the interval and prevents visual drift!
-            local_bit_dur = duration / num_bits
-
-            for k in range(num_bits):
-                # --- A: Calculate the visual boundary (start of the current bit) ---
-                b_time = start_t + k * local_bit_dur
-                b_idx = min(np.searchsorted(time_data, b_time), len(time_data) - 1)
-                boundary_times.append(time_data[b_idx])
-                boundary_volts.append(volt_data[b_idx])
-
-                # --- B: Calculate the exact center point (for drawing the 0/1 text) ---
-                c_time = start_t + (k + 0.5) * local_bit_dur
-                c_idx = min(np.searchsorted(time_data, c_time), len(time_data) - 1)
-                bit_centers_x.append(time_data[c_idx])
-                bit_centers_y.append(volt_data[c_idx])
-
-                # --- C: Save the actual logical value of the bit ---
-                bits.append(state)
-
-    # Append the absolute last boundary to close the plot seamlessly
-    last_idx = len(time_data) - 1
-    boundary_times.append(time_data[last_idx])
-    boundary_volts.append(volt_data[last_idx])
-
-    return bits, boundary_times, boundary_volts, bit_centers_x, bit_centers_y
-
-
-def extract_channel_features(time_data, volt_data):
-    """
-    Main orchestrator function.
-    Processes a raw analog channel into logical bits and plotting coordinates.
-    """
-    # Calculate a dynamic threshold to distinguish high (1) and low (0) states
-    threshold = (np.max(volt_data) + np.min(volt_data)) / 2.0
-    binary_signal = (volt_data > threshold).astype(int)
-
-    # Step 1: Find signal transitions and calculate the length of a single bit
-    base_bit_duration, transitions = estimate_bit_duration(time_data, binary_signal)
-
-    if base_bit_duration is None:
-        # Abort if the signal is too noisy or completely flat
-        return None
-
-    # Step 2: Organize the signal into discrete chunks of stable voltage
-    intervals = build_voltage_intervals(time_data, binary_signal, transitions)
-
-    # Step 3: Break down the intervals into individual bits and generate graph dots
-    bits, b_times, b_volts, c_x, c_y = compute_bit_coordinates(
-        time_data, volt_data, intervals, base_bit_duration
-    )
-
-    # Return a consolidated dictionary containing all processed information
-    return {
-        'threshold': threshold,
-        'bits': bits,
-        'boundary_times': b_times,
-        'boundary_volts': b_volts,
-        'bit_centers_x': c_x,
-        'bit_centers_y': c_y
-    }
-
-def csv_to_binary_sequence(file_path, plotting=False):
-    """
-    Main function 1: Returns a dictionary of pure binary sequences for all channels.
-    """
-    if plotting:
-        plot_channel_bits(file_path, channel_to_plot='1 (VOLT)')
-        plot_channel_bits(file_path, channel_to_plot='2 (VOLT)')
-    time_data, channel_data_dict = load_and_preprocess_csv(file_path)
-
-    if time_data is None:
-        return {}
-
-    results = {}
-    for ch_name, volt_data in channel_data_dict.items():
-        features = extract_channel_features(time_data, volt_data)
-
-        if features:
-            results[ch_name] = features['bits']
+    for i in range(1, len(time_data)):
+        if not in_packet:
+            # Detect packet start (K state: CH1 High, CH2 Low)
+            if bin_ch1[i] == 1 and bin_ch2[i] == 0:
+                if bin_ch1[i - 1] != 1 or bin_ch2[i - 1] != 0:
+                    in_packet = True
+                    start_time = time_data[i]
+                    last_sync_time = time_data[i]
+                    current_ch1 = 1
+                    current_ch2 = 0
+                    ch1_bits = []
+                    ch2_bits = []
+                    timestamps = []
         else:
-            results[ch_name] = []
+            elapsed = time_data[i] - last_sync_time
 
-    return results
+            # 1. Edge Detected: State has changed
+            if bin_ch1[i] != current_ch1 or bin_ch2[i] != current_ch2:
+                # Determine how many bits fit in this elapsed time using the ideal duration
+                num_bits = int(round(elapsed / ideal_bit_duration))
+
+                if num_bits > 0:
+                    # Calculate the actual physical duration of a bit in this specific chunk
+                    # This ensures symbols are perfectly centered even if the device's clock is slightly off
+                    actual_bit_duration = elapsed / num_bits
+
+                    for k in range(num_bits):
+                        ch1_bits.append(current_ch1)
+                        ch2_bits.append(current_ch2)
+                        timestamps.append(last_sync_time + (k + 0.5) * actual_bit_duration)
+
+                # CRITICAL FIX: Snap the sync clock to the ACTUAL physical time of the edge.
+                # This resets the accumulated drift to absolutely zero at every physical transition.
+                last_sync_time = time_data[i]
+
+                # Update current state
+                current_ch1 = bin_ch1[i]
+                current_ch2 = bin_ch2[i]
+
+            # 2. Check for SE0 (End of Packet)
+            elif current_ch1 == 0 and current_ch2 == 0 and elapsed >= (ideal_bit_duration * 0.5):
+                num_bits = int(round(elapsed / ideal_bit_duration))
+                if num_bits == 0: num_bits = 1
+
+                for k in range(num_bits):
+                    ch1_bits.append(0)
+                    ch2_bits.append(0)
+                    timestamps.append(last_sync_time + (k + 0.5) * ideal_bit_duration)
+
+                in_packet = False
+                packets[start_time] = {
+                    ch1_col: ch1_bits,
+                    ch2_col: ch2_bits,
+                    'timestamps': timestamps
+                }
+
+    if in_packet:
+        elapsed = time_data[-1] - last_sync_time
+        num_bits = int(round(elapsed / ideal_bit_duration))
+        if num_bits > 0:
+            actual_bit_duration = elapsed / num_bits
+            for k in range(num_bits):
+                ch1_bits.append(current_ch1)
+                ch2_bits.append(current_ch2)
+                timestamps.append(last_sync_time + (k + 0.5) * actual_bit_duration)
+
+        packets[start_time] = {
+            ch1_col: ch1_bits,
+            ch2_col: ch2_bits,
+            'timestamps': timestamps
+        }
+
+    symbol_packets = convert_packets_to_symbols(packets, ch1_col, ch2_col)
+    return symbol_packets
 
 
-def plot_channel_bits(file_path, channel_to_plot='1 (VOLT)'):
+def plot_packet_extraction_optimized(file_path):
     """
-    Main function 2: Visually plots the analog signal, boundaries, and bit values.
+    Visualizes packet extraction using the perfectly aligned physical timestamps.
     """
-    time_data, channel_data_dict = load_and_preprocess_csv(file_path)
+    all_packets = extract_packets_from_csv(file_path)
 
-    if time_data is None or channel_to_plot not in channel_data_dict:
-        print(f"Error loading data or channel {channel_to_plot} not found.")
-        return
+    df = pd.read_csv(file_path, header=0, skiprows=[1])
+    time_col = df.columns[0]
+    ch1_col = df.columns[1]
+    ch2_col = df.columns[2]
+    channel_cols = [ch1_col, ch2_col]
 
-    volt_data = channel_data_dict[channel_to_plot]
-    features = extract_channel_features(time_data, volt_data)
+    df = df.dropna(subset=[time_col] + channel_cols).reset_index(drop=True)
 
-    if not features:
-        print(f"Not enough valid data to plot {channel_to_plot}.")
-        return
+    time_data = df[time_col].values
+    volt_ch1 = df[ch1_col].values
+    volt_ch2 = df[ch2_col].values
 
-    # Render the plot using the features dictionary
-    plt.figure(figsize=(16, 7))
-    plt.plot(time_data, volt_data, label='Analog Signal', color='blue', alpha=0.6)
+    fig, axes = plt.subplots(nrows=2, ncols=1, figsize=(16, 12), sharex=True)
+    ax1, ax2 = axes[0], axes[1]
 
-    plt.scatter(features['boundary_times'], features['boundary_volts'],
-                color='red', zorder=5, label='Bit Boundaries', s=30)
+    ax1.plot(time_data, volt_ch1, color='blue', alpha=0.5, label=f'Channel {ch1_col}')
+    ax2.plot(time_data, volt_ch2, color='purple', alpha=0.5, label=f'Channel {ch2_col}')
 
-    plt.axhline(features['threshold'], color='green', linestyle='--',
-                label='Threshold', alpha=0.5)
+    for start_time, symbols in all_packets.items():
+        packet_len = len(symbols)
+        timestamps = getattr(symbols, 'timestamps', [])
 
-    y_range = np.max(volt_data) - np.min(volt_data)
-    text_offset = y_range * 0.05
+        # Guard clause if timestamps array is missing or empty
+        if not timestamps:
+            continue
 
-    for x, y, val in zip(features['bit_centers_x'], features['bit_centers_y'], features['bits']):
-        y_pos = y + text_offset if val == 1 else y - text_offset
-        plt.text(x, y_pos, str(val), fontsize=11, fontweight='bold',
-                 color='darkorange', ha='center', va='center', zorder=10)
+        end_time = timestamps[-1] + (1.0 / 1500000.0 / 2.0)
+        packet_center_time = start_time + ((end_time - start_time) / 2.0)
 
-    plt.title(f'Smart Signal Sync - {channel_to_plot}')
-    plt.xlabel('Time (s)')
-    plt.ylabel('Voltage (V)')
-    plt.legend(loc='upper right')
-    plt.grid(True)
+        # Draw boundaries & shading
+        ax1.axvline(start_time, color='lime', linestyle='-', linewidth=2)
+        ax1.axvline(end_time, color='red', linestyle='-', linewidth=2)
+        ax2.axvline(start_time, color='lime', linestyle='-', linewidth=2)
+        ax2.axvline(end_time, color='red', linestyle='-', linewidth=2)
+
+        ax1.axvspan(start_time, end_time, color='yellow', alpha=0.15)
+        ax2.axvspan(start_time, end_time, color='yellow', alpha=0.15)
+
+        # Length Badge
+        ax1.text(packet_center_time, 0.95, f'Len: {packet_len}',
+                 transform=ax1.get_xaxis_transform(), ha='center', va='top',
+                 fontsize=10, color='black', fontweight='bold',
+                 bbox=dict(facecolor='white', alpha=0.8, edgecolor='black', boxstyle='round,pad=0.3'),
+                 zorder=15)
+
+        # Annotate symbols using their exact physical timestamps
+        for symbol, bit_time in zip(symbols, timestamps):
+            ax1.text(bit_time, np.mean(volt_ch1), symbol,
+                     ha='center', va='center', fontsize=9, color='darkorange', fontweight='bold')
+            ax2.text(bit_time, np.mean(volt_ch2), symbol,
+                     ha='center', va='center', fontsize=9, color='darkorange', fontweight='bold')
+
+    ax1.set_title("Packet Extraction Visualization (Perfectly Aligned)")
+    ax1.set_ylabel("Voltage (V)")
+    ax2.set_xlabel("Time (s)")
+    ax2.set_ylabel("Voltage (V)")
+    ax1.grid(True)
+    ax2.grid(True)
+
     plt.tight_layout()
     plt.show()
 
+plot_packet_extraction_optimized("space pressed.csv")

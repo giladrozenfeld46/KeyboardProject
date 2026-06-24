@@ -4,65 +4,68 @@ import matplotlib
 matplotlib.use('TkAgg')
 
 
-def decode_differential_symbols(ch1_bits, ch2_bits):
+def decode_symbols_to_bits(symbol_packets):
     """
-    Takes two synchronized binary sequences and decodes them into symbols.
+    Converts a dictionary of symbols into a dictionary of payload bits.
+    Verifies and removes the sync sequence, applies NRZI decoding,
+    and performs bit destuffing (removing inserted 0 after six consecutive 1s).
     """
-    symbols = []
+    # Define the exact required start sequence
+    sync_sequence = ['K', 'J', 'K', 'J', 'K', 'J', 'K', 'K']
+    decoded_packets = {}
 
-    # Iterate through both sequences simultaneously.
-    # Since the new modular logic truncates both channels at the exact
-    # same starting timestamp, the bits are perfectly synchronized.
-    for b1, b2 in zip(ch1_bits, ch2_bits):
+    for start_time, symbols in symbol_packets.items():
+        # 1. Check if the packet is long enough
+        if len(symbols) < 8:
+            raise ValueError(f"Packet at {start_time:.6f}s is too short to contain a sync sequence.")
 
-        # Apply the specific logic mapping provided
-        if b1 == 0 and b2 == 0:
-            symbols.append("SE0")
+        # 2. Verify the exact sync sequence at the beginning
+        if symbols[:8] != sync_sequence:
+            raise ValueError(f"Invalid or missing sync sequence in packet at {start_time:.6f}s.")
 
-        elif b1 == 1 and b2 == 0:
-            symbols.append("K")
+        bits = []
 
-        elif b1 == 0 and b2 == 1:
-            symbols.append("J")
+        # 3. NRZI Decoding with Bit Destuffing
+        # The last symbol of the sync sequence ('K') serves as the reference
+        # state for decoding the very first payload bit.
+        prev_symbol = 'K'
 
-        elif b1 == 1 and b2 == 1:
-            symbols.append("SE1")
+        # Counter to track consecutive '1's for bit destuffing
+        consecutive_ones = 0
 
-    return symbols
+        # Start iterating immediately after the 8-symbol sync sequence
+        for current_symbol in symbols[8:]:
 
+            # SE0 signifies the End of Packet (EOP)
+            if current_symbol == 'SE0':
+                break
 
-def process_csv_to_symbols(file_path, ch1_name='1 (VOLT)', ch2_name='2 (VOLT)'):
-    """
-    End-to-end pipeline: extracts binary data from the CSV and converts
-    it into a single stream of differential symbols.
-    """
-    # 1. Get the binary sequences using the modularized function
-    # Note: csv_to_binary_sequence automatically handles the leading zeros truncation
-    binary_data = csv_to_binary_sequence(file_path, plotting=False)
+            # Decode valid differential states into bits
+            if current_symbol in ('K', 'J'):
+                if current_symbol == prev_symbol:
+                    decoded_bit = 1  # No state change means 1
+                else:
+                    decoded_bit = 0  # State change means 0
 
-    # Ensure data was extracted successfully and contains both required channels
-    if not binary_data or ch1_name not in binary_data or ch2_name not in binary_data:
-        print("Error: Could not find the required channels or data is empty.")
-        return []
+                # Update the reference symbol for the next iteration
+                prev_symbol = current_symbol
 
-    ch1_bits = binary_data[ch1_name]
-    ch2_bits = binary_data[ch2_name]
+                # Bit Destuffing Logic
+                # If we just saw six '1's, the current bit is the stuffed bit.
+                if consecutive_ones == 6:
+                    # Reset the counter and skip appending this bit to the payload
+                    consecutive_ones = 0
+                    continue
 
-    # 2. Convert the two binary streams into a single symbol stream
-    final_symbols = decode_differential_symbols(ch1_bits, ch2_bits)
+                # Append the valid bit to the payload
+                bits.append(decoded_bit)
 
-    return final_symbols
+                # Update the consecutive ones counter based on the current valid bit
+                if decoded_bit == 1:
+                    consecutive_ones += 1
+                else:
+                    consecutive_ones = 0
 
-# ==========================================
-# Example usage of the complete pipeline:
-# ==========================================
-# file_path = 'clean.csv'
-#
-# # Process everything directly from CSV to symbols
-# decoded_stream = process_csv_to_symbols(file_path)
-#
-# # Extract the individual data packets based on the start sequence
-# packets = extract_data_packets(decoded_stream)
-#
-# for idx, pkt in enumerate(packets):
-#     print(f"Packet {idx + 1} ({len(pkt)} bits): {pkt}")
+        decoded_packets[start_time] = bits
+
+    return decoded_packets

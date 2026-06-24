@@ -1,0 +1,5 @@
+time: -0.000085s, size: 24, Data: {'PID': 'IN', 'ADDR': 35, 'ENDP': '0001', 'CRC5': '01101', 'CRC_VALID': True}
+time: -0.000059s, size: 88, Data: {'PID': 'DATA1', 'DATA': '00000000001E0000', 'CRC16': '0100101010111100', 'CRC_VALID': True}
+time: 0.000009s, size: 8, Data: {'PID': 'ACK'}
+time: 0.000023s, size: 24, Data: {'PID': 'IN', 'ADDR': 35, 'ENDP': '0010', 'CRC5': '11110', 'CRC_VALID': True}
+time: 0.000049s, size: 8, Data: {'PID': 'NAK'}
