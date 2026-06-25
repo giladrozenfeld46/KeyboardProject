@@ -63,12 +63,15 @@ int main() {
         return -1;
     }
 
-    uint32_t target_rate_hz = 25000000; 
+    uint32_t target_rate_hz = 2000000; 
 
     // 1. Allocate separate memory blocks for each buffer (Scatter-Gather approach)
     for (int i = 0; i < NUM_BUFFERS; i++) {
         if (allocate_dma_buffer(&sample_bufs[i], BUFFER_BYTES) != 0) {
             printf("Failed to allocate sample buffer %d.\n", i);
+            for (int j = 0; j < i; j++) {
+                free_dma_buffer(&sample_bufs[j]);
+            }
             return -1;
         }
     }
@@ -76,6 +79,9 @@ int main() {
     // 2. Allocate memory for all Control Blocks in one contiguous array
     if (allocate_dma_buffer(&cb_buf, sizeof(struct DmaControlBlock) * NUM_BUFFERS) != 0) {
         printf("Failed to allocate control blocks.\n");
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            free_dma_buffer(&sample_bufs[i]);
+        }
         return -1;
     }
     
@@ -138,8 +144,8 @@ int main() {
             for (int i = 0; i < BUFFER_SAMPLES; i++) {
                 uint32_t val = current_samples[i];
                 
-                // Trigger condition: GPIO8 goes low
-                if (!(val & (1 << 0))) {
+                // Trigger condition: GPIO9 goes high
+                if (val & (1 << 1)) {
                     printf("Triggered in scattered buffer %d at local index %d!\n", finished_cb, i);
                     
                     found_trigger_index = i;
