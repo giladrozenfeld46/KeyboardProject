@@ -78,6 +78,13 @@ int main() {
     volatile uint32_t *dma_base = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, 0xFE007000);
     volatile uint32_t *dma_chan5 = dma_base + (0x500 / 4);
 
+    // --- THE FIX: HARDWARE DMA RESET ---
+    printf("Clearing DMA hardware ghosts...\n");
+    dma_chan5[0] = (1 << 31); // Set the RESET bit in the DMA CS register
+    usleep(1000);             // Give the silicon 1ms to flush its internal FIFOs
+    dma_chan5[0] = 0;         // Clear the register completely
+    // -----------------------------------
+
     start_dma_channel(dma_chan5, cb_buf.bus_addr);
     smi_start_capture(&smi_hw, 0xFFFFFFFF, target_rate_hz); 
 
