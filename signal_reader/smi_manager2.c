@@ -70,6 +70,9 @@ int main() {
     for (int i = 0; i < NUM_BUFFERS; i++) {
         if (allocate_dma_buffer(&sample_bufs[i], BUFFER_BYTES) != 0) {
             printf("Failed to allocate sample buffer %d.\n", i);
+            for (int j = 0; j < i; j++) {
+                free_dma_buffer(&sample_bufs[j]);
+            }
             return -1;
         }
     }
@@ -77,6 +80,9 @@ int main() {
     // 2. Allocate memory for all Control Blocks in one contiguous array
     if (allocate_dma_buffer(&cb_buf, sizeof(struct DmaControlBlock) * NUM_BUFFERS) != 0) {
         printf("Failed to allocate control blocks.\n");
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            free_dma_buffer(&sample_bufs[i]);
+        }
         return -1;
     }
     
