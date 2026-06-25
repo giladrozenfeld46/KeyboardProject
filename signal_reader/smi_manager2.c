@@ -121,6 +121,9 @@ int main() {
 
     // Stop hardware immediately to freeze the buffer
     smi_stop_capture(&smi_hw);
+    
+    // THE FIX: Explicitly abort the continuous DMA hardware loop!
+    stop_dma_channel(dma_chan5);
 
     if (triggered) {
         export_and_plot(samples, trigger_idx);
