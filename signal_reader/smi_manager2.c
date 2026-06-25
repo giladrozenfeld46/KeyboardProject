@@ -5,6 +5,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h> // Added for high-resolution timing
 
 #include "dma_mem.h"
 #include "dma_control.h"
@@ -69,9 +70,6 @@ int main() {
     for (int i = 0; i < NUM_BUFFERS; i++) {
         if (allocate_dma_buffer(&sample_bufs[i], BUFFER_BYTES) != 0) {
             printf("Failed to allocate sample buffer %d.\n", i);
-            for (int j = 0; j < i; j++) {
-                free_dma_buffer(&sample_bufs[j]);
-            }
             return -1;
         }
     }
@@ -79,9 +77,6 @@ int main() {
     // 2. Allocate memory for all Control Blocks in one contiguous array
     if (allocate_dma_buffer(&cb_buf, sizeof(struct DmaControlBlock) * NUM_BUFFERS) != 0) {
         printf("Failed to allocate control blocks.\n");
-        for (int i = 0; i < NUM_BUFFERS; i++) {
-            free_dma_buffer(&sample_bufs[i]);
-        }
         return -1;
     }
     
@@ -110,13 +105,18 @@ int main() {
     usleep(1000); 
     dma_chan5[0] = 0;
 
+    // Variables for performance metrics
+    struct timespec start_scan, end_scan;
+    uint64_t total_scan_time_ns = 0;
+    uint64_t total_samples_scanned = 0;
+
     // 5. Start DMA using the first control block
     start_dma_channel(dma_chan5, cb_buf.bus_addr);
     
     // Start SMI at continuous mode
     smi_start_capture(&smi_hw, 0xFFFFFFFF, target_rate_hz); 
 
-    printf("Armed (%d scattered buffers chained). Waiting for falling edge on GPIO8...\n", NUM_BUFFERS);
+    printf("Armed (%d scattered buffers chained). Waiting for rising edge on GPIO9...\n", NUM_BUFFERS);
 
     uint32_t* safe_storage = malloc(BUFFER_BYTES);
     
@@ -140,25 +140,43 @@ int main() {
             // Access the virtual memory of the specific buffer that was just completed
             volatile uint32_t* current_samples = (volatile uint32_t*)sample_bufs[finished_cb].virtual_addr;
             
+            int local_triggered = 0;
+
+            // Start scanning timer
+            clock_gettime(CLOCK_MONOTONIC, &start_scan);
+
             // Scan only the newly completed buffer safely
             for (int i = 0; i < BUFFER_SAMPLES; i++) {
                 uint32_t val = current_samples[i];
+                total_samples_scanned++;
                 
                 // Trigger condition: GPIO9 goes high
                 if (val & (1 << 1)) {
-                    printf("Triggered in scattered buffer %d at local index %d!\n", finished_cb, i);
-                    
                     found_trigger_index = i;
-
-                    // Copy this safe, completed buffer to our permanent storage
-                    for(int j = 0; j < BUFFER_SAMPLES; j++) {
-                        safe_storage[j] = current_samples[j];
-                    }
-                    
-                    triggered = 1;
-                    keep_running = 0; // Break main loop
-                    break;
+                    local_triggered = 1;
+                    break; // Stop scanning, trigger found
                 }
+            }
+
+            // End scanning timer
+            clock_gettime(CLOCK_MONOTONIC, &end_scan);
+            
+            // Accumulate scan time
+            uint64_t ns_spent = (end_scan.tv_sec - start_scan.tv_sec) * 1000000000ULL + 
+                                (end_scan.tv_nsec - start_scan.tv_nsec);
+            total_scan_time_ns += ns_spent;
+
+            // If triggered, handle the data copying OUTSIDE the timer to get accurate sample scan times
+            if (local_triggered) {
+                printf("Triggered in scattered buffer %d at local index %d!\n", finished_cb, found_trigger_index);
+                
+                // Copy this safe, completed buffer to our permanent storage
+                for(int j = 0; j < BUFFER_SAMPLES; j++) {
+                    safe_storage[j] = current_samples[j];
+                }
+                
+                triggered = 1;
+                keep_running = 0; // Break main loop
             }
             
             // Update the tracker
@@ -170,12 +188,31 @@ int main() {
 
     // Stop hardware completely
     smi_stop_capture(&smi_hw);
+
+    // Measure time taken to stop the DMA
+    struct timespec start_stop, end_stop;
+    clock_gettime(CLOCK_MONOTONIC, &start_stop);
+    
     stop_dma_channel(dma_chan5);
+    
+    clock_gettime(CLOCK_MONOTONIC, &end_stop);
+    uint64_t stop_time_ns = (end_stop.tv_sec - start_stop.tv_sec) * 1000000000ULL + 
+                            (end_stop.tv_nsec - start_stop.tv_nsec);
+
+    // Print Performance Metrics
+    printf("\n--- Performance Metrics ---\n");
+    if (total_samples_scanned > 0) {
+        double avg_scan_time = (double)total_scan_time_ns / total_samples_scanned;
+        printf("Average time to scan a single sample: %.2f ns\n", avg_scan_time);
+    }
+    printf("Time taken to stop DMA hardware: %llu ns (%.2f us)\n", 
+           (unsigned long long)stop_time_ns, stop_time_ns / 1000.0);
+    printf("---------------------------\n\n");
 
     if (triggered) {
         export_and_plot(safe_storage, found_trigger_index); 
     } else {
-        printf("\nCapture aborted manually.\n");
+        printf("Capture aborted manually.\n");
     }
 
     // Cleanup resources
