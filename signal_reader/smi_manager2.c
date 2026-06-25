@@ -41,6 +41,7 @@ void export_and_plot(uint32_t* safe_buffer, uint32_t trigger_index) {
         int gpio8 = (val & (1 << 0)) ? 1 : 0;
         int gpio9 = (val & (1 << 1)) ? 1 : 0;
         
+        // Align the actual trigger event to x=0 on the graph
         fprintf(fp, "%d,%d,%d\n", i - (int)trigger_index, gpio8, gpio9);
     }
     fclose(fp);
@@ -113,6 +114,7 @@ int main() {
     
     int triggered = 0;
     uint32_t current_cb_index = 0; 
+    uint32_t found_trigger_index = 0; // Store the exact index of the trigger
 
     while (keep_running) {
         // Read the physical address of the currently active control block
@@ -132,10 +134,13 @@ int main() {
             for (int i = 0; i < BUFFER_SAMPLES; i++) {
                 uint32_t val = samples[start_idx + i];
                 
-                // Trigger condition: GPIO8 goes low
-                if (!(val & (1 << 0))) {
+                // Trigger condition: GPIO9 goes high
+                if (val & (1 << 1)) {
                     printf("Triggered in buffer %d at local index %d!\n", finished_cb, i);
                     
+                    // Save the exact index where the signal dropped
+                    found_trigger_index = i;
+
                     // Copy this safe, completed buffer to our permanent storage
                     for(int j = 0; j < BUFFER_SAMPLES; j++) {
                         safe_storage[j] = samples[start_idx + j];
@@ -159,7 +164,8 @@ int main() {
     stop_dma_channel(dma_chan5);
 
     if (triggered) {
-        export_and_plot(safe_storage, 0); 
+        // Pass the exact trigger index to the plotting function
+        export_and_plot(safe_storage, found_trigger_index); 
     } else {
         printf("\nCapture aborted manually.\n");
     }
