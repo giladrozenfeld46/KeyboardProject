@@ -111,7 +111,7 @@ int main() {
                     trigger_idx = last_index;
                     // Set the stop target 1024 samples into the future
                     target_stop_idx = (last_index + (FIXED_BUFFER_SAMPLES / 2)) % FIXED_BUFFER_SAMPLES;
-                    printf("Triggered! Capturing post-trigger data...\n");
+                    
                 }
             } else {
                 // We are triggered, wait until we hit the target stop index
@@ -123,7 +123,7 @@ int main() {
 
             last_index = (last_index + 1) % FIXED_BUFFER_SAMPLES;
         }
-        usleep(100); 
+         
     }
 
     // Stop hardware immediately to freeze the buffer
