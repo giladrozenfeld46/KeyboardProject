@@ -10,11 +10,10 @@
 #include "dma_control.h"
 #include "smi_hal.h"
 
-// Configuration for 4 buffers, each 4096 bytes (1024 samples)
+// Configuration for multiple separate buffers, each 4096 bytes (1024 samples)
 #define BUFFER_SAMPLES       1024 
 #define BUFFER_BYTES         (BUFFER_SAMPLES * 4) 
-#define NUM_BUFFERS          4
-#define TOTAL_BUFFER_BYTES   (BUFFER_BYTES * NUM_BUFFERS)
+#define NUM_BUFFERS          16
 
 // DMA Configuration: SMI DREQ, Wait for DREQ, Increment Dest, Interrupt Enable
 #define DMA_TI_SMI_CIRCULAR  ((4 << 16) | (1 << 10) | (1 << 4) | (1 << 2))
@@ -51,26 +50,30 @@ void export_and_plot(uint32_t* safe_buffer, uint32_t trigger_index) {
 }
 
 int main() {
-    printf("--- SMI 4-Stage Circular Logic Analyzer ---\n");
+    printf("--- SMI Scatter-Gather Logic Analyzer (%d Buffers) ---\n", NUM_BUFFERS);
     signal(SIGINT, handle_sigint);
 
-    DmaBuffer cb_buf, sample_buf;
+    DmaBuffer cb_buf;
+    DmaBuffer sample_bufs[NUM_BUFFERS]; // Array of separate DMA buffers
     SmiHardware smi_hw;
+    
     int mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
     if (mem_fd < 0) {
         printf("Error: Cannot open /dev/mem. Use sudo.\n");
         return -1;
     }
 
-    uint32_t target_rate_hz = 2000000; 
+    uint32_t target_rate_hz = 25000000; 
 
-    // 1. Allocate contiguous memory for all 4 buffers combined
-    if (allocate_dma_buffer(&sample_buf, TOTAL_BUFFER_BYTES) != 0) {
-        printf("Failed to allocate sample buffer.\n");
-        return -1;
+    // 1. Allocate separate memory blocks for each buffer (Scatter-Gather approach)
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (allocate_dma_buffer(&sample_bufs[i], BUFFER_BYTES) != 0) {
+            printf("Failed to allocate sample buffer %d.\n", i);
+            return -1;
+        }
     }
     
-    // 2. Allocate memory for 4 Control Blocks
+    // 2. Allocate memory for all Control Blocks in one contiguous array
     if (allocate_dma_buffer(&cb_buf, sizeof(struct DmaControlBlock) * NUM_BUFFERS) != 0) {
         printf("Failed to allocate control blocks.\n");
         return -1;
@@ -78,10 +81,10 @@ int main() {
     
     struct DmaControlBlock* cbs = (struct DmaControlBlock*)cb_buf.virtual_addr;
 
-    // 3. Chain the 4 blocks together (0->1->2->3->0)
+    // 3. Chain the blocks together, pointing each to its respective physical buffer
     for (int i = 0; i < NUM_BUFFERS; i++) {
         setup_dma_control_block(&cbs[i], DMA_TI_SMI_CIRCULAR, 0x7E60000C, 
-                                sample_buf.bus_addr + (i * BUFFER_BYTES), BUFFER_BYTES);
+                                sample_bufs[i].bus_addr, BUFFER_BYTES);
         
         if (i == NUM_BUFFERS - 1) {
             // The last block points back to the very first block
@@ -107,20 +110,19 @@ int main() {
     // Start SMI at continuous mode
     smi_start_capture(&smi_hw, 0xFFFFFFFF, target_rate_hz); 
 
-    printf("Armed (4 buffers chained). Waiting for falling edge on GPIO8...\n");
+    printf("Armed (%d scattered buffers chained). Waiting for falling edge on GPIO8...\n", NUM_BUFFERS);
 
-    volatile uint32_t* samples = (volatile uint32_t*)sample_buf.virtual_addr;
     uint32_t* safe_storage = malloc(BUFFER_BYTES);
     
     int triggered = 0;
     uint32_t current_cb_index = 0; 
-    uint32_t found_trigger_index = 0; // Store the exact index of the trigger
+    uint32_t found_trigger_index = 0; 
 
     while (keep_running) {
         // Read the physical address of the currently active control block
         uint32_t active_cb_addr = dma_chan5[0x04 / 4]; 
         
-        // Calculate the index (0 to 3) of the active block
+        // Calculate the index (0 to NUM_BUFFERS - 1) of the active block
         uint32_t active_cb_index = (active_cb_addr - cb_buf.bus_addr) / sizeof(struct DmaControlBlock);
 
         // Safety check to ensure the index is valid and see if it moved
@@ -128,22 +130,23 @@ int main() {
             
             // The DMA moved to a new block, meaning it just finished the previous block
             uint32_t finished_cb = current_cb_index;
-            uint32_t start_idx = finished_cb * BUFFER_SAMPLES;
+            
+            // Access the virtual memory of the specific buffer that was just completed
+            volatile uint32_t* current_samples = (volatile uint32_t*)sample_bufs[finished_cb].virtual_addr;
             
             // Scan only the newly completed buffer safely
             for (int i = 0; i < BUFFER_SAMPLES; i++) {
-                uint32_t val = samples[start_idx + i];
+                uint32_t val = current_samples[i];
                 
-                // Trigger condition: GPIO9 goes high
-                if (val & (1 << 1)) {
-                    printf("Triggered in buffer %d at local index %d!\n", finished_cb, i);
+                // Trigger condition: GPIO8 goes low
+                if (!(val & (1 << 0))) {
+                    printf("Triggered in scattered buffer %d at local index %d!\n", finished_cb, i);
                     
-                    // Save the exact index where the signal dropped
                     found_trigger_index = i;
 
                     // Copy this safe, completed buffer to our permanent storage
                     for(int j = 0; j < BUFFER_SAMPLES; j++) {
-                        safe_storage[j] = samples[start_idx + j];
+                        safe_storage[j] = current_samples[j];
                     }
                     
                     triggered = 1;
@@ -164,7 +167,6 @@ int main() {
     stop_dma_channel(dma_chan5);
 
     if (triggered) {
-        // Pass the exact trigger index to the plotting function
         export_and_plot(safe_storage, found_trigger_index); 
     } else {
         printf("\nCapture aborted manually.\n");
@@ -174,7 +176,11 @@ int main() {
     smi_cleanup(&smi_hw);
     if (dma_base != MAP_FAILED) munmap((void*)dma_base, 4096);
     close(mem_fd);
-    free_dma_buffer(&sample_buf);
+    
+    // Free all scattered buffers
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        free_dma_buffer(&sample_bufs[i]);
+    }
     free_dma_buffer(&cb_buf);
     free(safe_storage);
     
