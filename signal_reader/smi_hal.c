@@ -18,45 +18,43 @@
 #define SMI_DSW0_REG         0x14  
 #define SMI_DMC_REG          0x30  
 
-// --- Clock Manager (CM) & GPIO Register offsets (RESTORED) ---
+// --- Clock Manager (CM) & GPIO Register offsets ---
 #define CM_SMICTL            0xB0
 #define CM_SMIDIV            0xB4
 #define CM_PASSWD            0x5A000000 
 #define GPFSEL0              0x00 
 #define GPPUPPDN0            0x39 
 
-// SMI Control Bits (SMI_CS_REG)
+// SMI Control Bits
 #define SMI_CS_ENABLE        (1 << 0)
 #define SMI_CS_START         (1 << 3)  
 #define SMI_CS_CLEAR         (1 << 4)  
 
-// SMI DMA Control Bits (SMI_DMC_REG)
+// SMI DMA Control Bits
 #define SMI_DMC_DMAEN        (1 << 28) 
 #define SMI_DMC_PANICR_SHIFT 18
 #define SMI_DMC_REQR_SHIFT   6
 #define SMI_DMC_REQR_1       (1 << SMI_DMC_REQR_SHIFT)   
 #define SMI_DMC_PANICR_1     (1 << SMI_DMC_PANICR_SHIFT) 
 
-// Timing Register Shifts (SMI_DSR0_REG)
+// Timing Register Shifts
 #define SMI_DSR_SETUP_SHIFT  28
 #define SMI_DSR_STROBE_SHIFT 14
 #define SMI_DSR_HOLD_SHIFT   7
 #define SMI_DSR_PACE_SHIFT   0
 
-// Hardware Constraints
+// Hardware Constraints & Clock definitions
 #define SMI_SOURCE_CLOCK_HZ  500000000 
 #define SMI_MAX_DIVISOR      32        
 #define SMI_MAX_TOTAL_CYCLES 252       
-#define SMI_MIN_TOTAL_CYCLES 4        
-
-// Add this definition near the top of smi_hal.c if missing
-#define CM_SMI_BUSY          (1 << 7)
-#define CM_CLK_SRC_PLLD      6        // 500 MHz clock source
+#define SMI_MIN_TOTAL_CYCLES 4         
 
 #define GPIO_FUNC_MASK       7         
 #define GPIO_FUNC_ALT1       5         
 #define GPIO_PUPD_MASK       3         
 
+#define CM_SMI_BUSY          (1 << 7)
+#define CM_CLK_SRC_PLLD      6        // 500 MHz clock source
 
 int smi_init(SmiHardware* hw, int mem_fd) {
     hw->smi  = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, SMI_BASE);
@@ -112,13 +110,12 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     hw->cm[CM_SMICTL / 4] = CM_PASSWD | 0; 
     
     // Step B: Poll BUSY bit until the hardware successfully comes to a full stop
-    // Without this loop, the hardware ignores any writes to CM_SMIDIV!
     int timeout = 100000;
     while ((hw->cm[CM_SMICTL / 4] & CM_SMI_BUSY) && timeout > 0) {
         timeout--;
     }
 
-    // Step C: Now that the clock generator is completely idle, write the new divisor safely
+    // Step C: Now that the clock generator is idle, write the new divisor safely
     hw->cm[CM_SMIDIV / 4] = CM_PASSWD | (clock_divisor << 12); 
     usleep(10);
     
@@ -146,11 +143,23 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     hw->smi[SMI_CS_REG / 4] = SMI_CS_ENABLE | SMI_CS_START;
 }
 
+void smi_stop_capture(SmiHardware* hw) {
+    if (!hw || !hw->gpio || !hw->smi) return;
+
+    // Instantly revert pins to standard High-Z Input to stop driving the bus
+    hw->gpio[GPFSEL0] &= ~((GPIO_FUNC_MASK << 24) | (GPIO_FUNC_MASK << 27));
+
+    // Shut down the SMI engine
+    hw->smi[SMI_CS_REG / 4] = 0;
+    hw->smi[SMI_DMC_REG / 4] = 0; 
+}
+
 void smi_cleanup(SmiHardware* hw) {
     if (!hw) return;
     
     smi_stop_capture(hw);
     
+    // Unmap memory
     if (hw->smi != MAP_FAILED) munmap((void*)hw->smi, 4096);
     if (hw->cm != MAP_FAILED) munmap((void*)hw->cm, 4096);
     if (hw->gpio != MAP_FAILED) munmap((void*)hw->gpio, 4096);
