@@ -204,7 +204,7 @@ void run_debug0_fast_path() {
  */
 DecoderState handle_state_wait_activity(Symbol sym, int debug_mode) {
     // Check for unusual activity: D+ going high OR D- going low
-    if (sym.dplus == 1 || sym.dminus == 0) {
+    if (sym.dplus == 1) {
         printf("Unusual line activity detected (D+ HIGH or D- LOW)!\n");
         
         if (debug_mode == 1) {
@@ -348,8 +348,8 @@ int main(int argc, char *argv[]) {
     
     // Usually in USB (Full Speed): K J K J K J K K
     Symbol expected_sync[8] = {
-        {0, 1}, {1, 0}, {0, 1}, {1, 0}, 
-        {0, 1}, {1, 0}, {0, 1}, {0, 1}
+        {1, 0}, {0, 1}, {1, 0}, {0, 1}, 
+        {1, 0}, {0, 1}, {1, 0}, {1, 0}
     };
 
     // Arrays and trackers for ANALYZE state
