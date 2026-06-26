@@ -8,6 +8,7 @@
 
 #include "smi_manager.h"
 #include "state_machine.h"
+#include "usb_decoder.h" // Added USB Packet Decoder
 
 #define CHUNK_SIZE 8
 
@@ -267,10 +268,10 @@ void output_decoder_results(int debug_mode, Symbol* debug_buffer, int debug_coun
             printf("No debug symbols were collected.\n");
         }
     } else if (debug_mode == -1) {
+        // Only print if there's an incomplete packet interrupted by Ctrl+C
         if (bit_count > 0) {
+            printf("\n[Interrupted] Incomplete packet data (%d bits):\n", bit_count);
             print_decoded_bits(bit_buffer, bit_count);
-        } else {
-            printf("No data was decoded.\n");
         }
     }
 }
@@ -322,7 +323,24 @@ void run_main_decoder_loop(int debug_mode) {
                     break;
                     
                 case STATE_ANALYZE:
-                    state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count, &keep_running);
+                    {
+                        DecoderState next_state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count, &keep_running);
+                        
+                        // Check if we finished reading the current packet (SE0 detected)
+                        if (next_state == STATE_WAIT_ACTIVITY) {
+                            
+                            // Send the collected bits directly to the USB decoder right now!
+                            if (bit_count > 0) {
+                                print_decoded_bits(bit_buffer, bit_count);
+                                analyze_usb_packet(bit_buffer, bit_count, 0); 
+                            }
+                            
+                            bit_count = 0;    // Reset the bit counter for the next packet
+                            keep_running = 1; // Override the stop signal to CONTINUE listening for more packets!
+                        }
+                        
+                        state = next_state;
+                    }
                     break;
 
                 case STATE_DEBUG:
