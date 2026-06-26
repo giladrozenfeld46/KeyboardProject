@@ -37,7 +37,7 @@ void export_and_plot(uint32_t* buffer, int count) {
         
         // Since the trigger is strictly before index 0 of this buffer, 
         // we can just plot from index 0 sequentially.
-        fprintf(fp, "%d,%d,%d\n", i, dplus, dminus);
+        fprintf(fp, "%d,%d,%d\n", i, dminus, dplus);
     }
     fclose(fp);
 
