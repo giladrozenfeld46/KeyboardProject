@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h> // Required for high-resolution timing
 
 #include "smi_manager.h"
 
@@ -62,12 +63,20 @@ int main() {
     uint32_t prev_sample = 0;
     int has_history = 0;
 
+    // Variables for performance metrics
+    struct timespec start_scan, end_scan;
+    uint64_t total_scan_time_ns = 0;
+    uint64_t total_samples_analyzed = 0;
+
     printf("Waiting for RISING EDGE on D+...\n");
 
     while (keep_running) {
         // Attempt to pull a chunk of 8 samples from the SMI manager
         if (smi_manager_read_chunk(chunk)) {
             
+            // Start the timer for this chunk analysis
+            clock_gettime(CLOCK_MONOTONIC, &start_scan);
+
             if (!triggered) {
                 // STATE 1: Searching for the trigger
                 for (int i = 0; i < CHUNK_SIZE; i++) {
@@ -98,12 +107,22 @@ int main() {
                 for (int i = 0; i < CHUNK_SIZE && collected < POST_TRIGGER_SAMPLES; i++) {
                     post_trigger_buffer[collected++] = chunk[i];
                 }
-                
-                // Stop the main loop if we have collected exactly what we need
-                if (collected >= POST_TRIGGER_SAMPLES) {
-                    break; 
-                }
             }
+
+            // Stop the timer after the chunk is fully analyzed
+            clock_gettime(CLOCK_MONOTONIC, &end_scan);
+            
+            // Accumulate scan time
+            uint64_t ns_spent = (end_scan.tv_sec - start_scan.tv_sec) * 1000000000ULL + 
+                                (end_scan.tv_nsec - start_scan.tv_nsec);
+            total_scan_time_ns += ns_spent;
+            total_samples_analyzed += CHUNK_SIZE;
+
+            // Stop the main loop if we have collected exactly what we need
+            if (collected >= POST_TRIGGER_SAMPLES) {
+                break; 
+            }
+
         } else {
             // No chunk ready yet. Small sleep to prevent 100% CPU usage.
             usleep(1);
@@ -112,6 +131,15 @@ int main() {
 
     // Stop hardware and unmap memory
     smi_manager_cleanup();
+
+    // Print Performance Metrics
+    printf("\n--- Performance Metrics ---\n");
+    if (total_samples_analyzed > 0) {
+        double avg_scan_time = (double)total_scan_time_ns / total_samples_analyzed;
+        printf("Average time to analyze a single sample: %.2f ns\n", avg_scan_time);
+    }
+    printf("Total samples analyzed: %llu\n", (unsigned long long)total_samples_analyzed);
+    printf("---------------------------\n\n");
 
     // Plot if we successfully collected the post-trigger data
     if (triggered && collected > 0) {
