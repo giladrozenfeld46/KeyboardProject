@@ -11,8 +11,9 @@
 #define CHUNK_SIZE 8
 #define MAX_DECODED_BITS 2048
 
-// Changed to a float to allow fractional sampling (e.g., exactly 5.5 samples per symbol on average)
-#define SAMPLES_PER_SYMBOL 5.5f
+// Symbol extraction configuration based on consecutive samples
+#define TARGET_SYMBOL_SAMPLES 6
+#define MIN_SYMBOL_SAMPLES 4
 
 // Debug configurations
 #define DEBUG_SYMBOLS_COUNT 128 
@@ -44,15 +45,17 @@ typedef enum {
 
 /**
  * Exclusively pulls chunks from SMI Manager and extracts valid symbols.
- * Uses fractional synchronization logic: waits for 'samples_per_symbol' (float) to prevent drift.
+ * Uses a digital filter logic: 
+ * If a value repeats TARGET_SYMBOL_SAMPLES times, it's a valid symbol.
+ * If the value changes, but the previous value repeated at least MIN_SYMBOL_SAMPLES times, 
+ * it emits the previous value and uses the new sample as the start of the next symbol.
+ * This filters out line skew/glitches and handles slight frequency drifts gracefully.
  */
-int get_next_symbol(Symbol* out_symbol, float samples_per_symbol) {
+int get_next_symbol(Symbol* out_symbol) {
     static uint32_t chunk[CHUNK_SIZE];
     static int chunk_idx = CHUNK_SIZE; 
     static uint32_t current_val = 0xFFFFFFFF;
-    
-    // Using float to maintain fractional remainders over long stable sequences
-    static float consecutive_count = 0.0f; 
+    static int consecutive_count = 0; 
 
     while (keep_running) {
         if (chunk_idx >= CHUNK_SIZE) {
@@ -68,27 +71,38 @@ int get_next_symbol(Symbol* out_symbol, float samples_per_symbol) {
 
         if (current_val == 0xFFFFFFFF) {
             current_val = masked_val;
-            consecutive_count = 1.0f;
+            consecutive_count = 1;
             continue;
         }
 
         if (masked_val == current_val) {
-            consecutive_count += 1.0f;
+            consecutive_count++;
             
-            if (consecutive_count >= samples_per_symbol) {
-                out_symbol->dplus = (masked_val & DPLUS_BIT_MASK) ? 1 : 0;
-                out_symbol->dminus = (masked_val & DMINUS_BIT_MASK) ? 1 : 0;
+            if (consecutive_count >= TARGET_SYMBOL_SAMPLES) {
+                out_symbol->dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
+                out_symbol->dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
                 
-                // Subtract instead of setting to 0 to keep the fractional remainder!
-                // Example: if threshold is 5.5, count reaches 6.0, remainder is 0.5.
-                // This prevents drifting out of phase over long identical symbol runs.
-                consecutive_count -= samples_per_symbol; 
+                // Reset to 0 so the next sample starts counting towards the next symbol
+                consecutive_count = 0; 
                 return 1;
             }
         } else {
-            // Signal edge detected, resynchronize starting at count 1.0
-            current_val = masked_val;
-            consecutive_count = 1.0f;
+            // Signal edge detected!
+            if (consecutive_count >= MIN_SYMBOL_SAMPLES) {
+                // The previous state held long enough to be a valid symbol
+                out_symbol->dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
+                out_symbol->dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
+                
+                // Start tracking the new state immediately
+                current_val = masked_val;
+                consecutive_count = 1;
+                return 1;
+            } else {
+                // The previous state was too short (noise, line skew glitch, or transition).
+                // Ignore it and start tracking the new state.
+                current_val = masked_val;
+                consecutive_count = 1;
+            }
         }
     }
     return 0;
@@ -213,31 +227,38 @@ void run_debug1_fast_path() {
         Symbol debug_symbols[DEBUG_SYMBOLS_COUNT];
         int sym_count = 0;
         uint32_t current_val = 0xFFFFFFFF;
-        
-        float consecutive_count = 0.0f; // float for fractional precision
-        float samples_per_symbol = SAMPLES_PER_SYMBOL;
+        int consecutive_count = 0; 
         
         for (int i = 0; i < collected; i++) {
             uint32_t masked_val = sample_buffer[i] & (DPLUS_BIT_MASK | DMINUS_BIT_MASK);
             
             if (current_val == 0xFFFFFFFF) {
                 current_val = masked_val;
-                consecutive_count = 1.0f;
+                consecutive_count = 1;
                 continue;
             }
             
             if (masked_val == current_val) {
-                consecutive_count += 1.0f;
-                if (consecutive_count >= samples_per_symbol) {
-                    debug_symbols[sym_count].dplus = (masked_val & DPLUS_BIT_MASK) ? 1 : 0;
-                    debug_symbols[sym_count].dminus = (masked_val & DMINUS_BIT_MASK) ? 1 : 0;
+                consecutive_count++;
+                if (consecutive_count >= TARGET_SYMBOL_SAMPLES) {
+                    debug_symbols[sym_count].dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
+                    debug_symbols[sym_count].dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
                     sym_count++;
-                    consecutive_count -= samples_per_symbol; // keep fraction
+                    consecutive_count = 0; 
                     if (sym_count >= DEBUG_SYMBOLS_COUNT) break;
                 }
             } else {
-                current_val = masked_val;
-                consecutive_count = 1.0f;
+                if (consecutive_count >= MIN_SYMBOL_SAMPLES) {
+                    debug_symbols[sym_count].dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
+                    debug_symbols[sym_count].dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
+                    sym_count++;
+                    current_val = masked_val;
+                    consecutive_count = 1;
+                    if (sym_count >= DEBUG_SYMBOLS_COUNT) break;
+                } else {
+                    current_val = masked_val;
+                    consecutive_count = 1;
+                }
             }
         }
         
@@ -430,8 +451,8 @@ int main(int argc, char *argv[]) {
 
     // The clean main loop
     while (keep_running) {
-        // Passing the SAMPLES_PER_SYMBOL float to the symbol extraction logic
-        if (get_next_symbol(&sym, SAMPLES_PER_SYMBOL)) {
+        // Calling get_next_symbol with the new filtering algorithm
+        if (get_next_symbol(&sym)) {
             
             // Start measuring the state machine processing time
             clock_gettime(CLOCK_MONOTONIC, &start_time);
