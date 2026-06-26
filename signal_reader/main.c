@@ -8,7 +8,7 @@
 
 #include "smi_manager.h"
 #include "state_machine.h"
-#include "usb_decoder.h" // Added USB Packet Decoder
+#include "usb_decoder.h" 
 
 #define CHUNK_SIZE 8
 
@@ -16,8 +16,9 @@
 #define TARGET_SYMBOL_SAMPLES 6
 #define MIN_SYMBOL_SAMPLES 4
 
-// Debug configurations
+// Debug and Recording configurations
 #define DEBUG_SAMPLES_COUNT 1024 
+#define MAX_RECORDED_PACKETS 10000 // Maximum number of packets to hold in RAM before writing
 
 // Assuming D+ is connected to GPIO9 (Bit 1). Change the shift if it's on a different pin.
 #define DPLUS_BIT_MASK (1 << 1) 
@@ -30,14 +31,16 @@ void handle_sigint(int sig) {
     keep_running = 0;
 }
 
+// Structure to hold a single packet's raw bits in RAM
+typedef struct {
+    uint8_t bits[MAX_DECODED_BITS];
+    int bit_count;
+} RecordedPacket;
+
 /* =========================================================
  * CORE HARDWARE SAMPLING & DIGITAL FILTERING
  * ========================================================= */
 
-/**
- * Exclusively pulls chunks from SMI Manager and extracts valid symbols.
- * Uses a digital filter logic to discard noise and handle line skew.
- */
 int get_next_symbol(Symbol* out_symbol) {
     static uint32_t chunk[CHUNK_SIZE];
     static int chunk_idx = CHUNK_SIZE; 
@@ -130,7 +133,16 @@ void export_and_plot_symbols(Symbol* buffer, int count) {
     system("python3 plot_waveform.py");
 }
 
-void print_decoded_bits(uint8_t* bits, int count) {
+void fprint_decoded_bits(FILE* stream, const uint8_t* bits, int count) {
+    fprintf(stream, "Bits (%d): ", count);
+    for (int i = 0; i < count; i++) {
+        fprintf(stream, "%d", bits[i]);
+        if ((i + 1) % 8 == 0) fprintf(stream, " "); 
+    }
+    fprintf(stream, "\n");
+}
+
+void print_decoded_bits(const uint8_t* bits, int count) {
     printf("\n--- Decoded NRZI Bits (%d bits) ---\n", count);
     for (int i = 0; i < count; i++) {
         printf("%d", bits[i]);
@@ -276,7 +288,30 @@ void output_decoder_results(int debug_mode, Symbol* debug_buffer, int debug_coun
     }
 }
 
-void run_main_decoder_loop(int debug_mode) {
+void flush_records_to_file(RecordedPacket* records, int count) {
+    if (count == 0) return;
+    
+    printf("\nSaving %d recorded packets to 'recorded_packets.txt'...\n", count);
+    FILE *fp = fopen("recorded_packets.txt", "w");
+    if (!fp) {
+        printf("Error: Could not open recorded_packets.txt for writing.\n");
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        fprintf(fp, "=== Packet #%d ===\n", i + 1);
+        fprint_decoded_bits(fp, records[i].bits, records[i].bit_count);
+        
+        UsbPacket pkt_info = analyze_usb_packet(records[i].bits, records[i].bit_count);
+        fprint_usb_packet(fp, &pkt_info, 0);
+        fprintf(fp, "\n");
+    }
+
+    fclose(fp);
+    printf("Successfully saved records to file.\n");
+}
+
+void run_main_decoder_loop(int debug_mode, int record_mode) {
     DecoderState state = STATE_WAIT_ACTIVITY;
     Symbol sym;
     Symbol sync_buffer[8] = {{0, 0}}; 
@@ -290,12 +325,24 @@ void run_main_decoder_loop(int debug_mode) {
     uint8_t bit_buffer[MAX_DECODED_BITS];
     int bit_count = 0;
     Symbol prev_symbol = {0, 0};
-    
-    // Added tracker for USB Bit Stuffing
     int consecutive_ones = 0;
 
     Symbol debug_buffer[DEBUG_SYMBOLS_COUNT];
     int debug_count = 0;
+    
+    // RAM buffer for recording multiple packets before file I/O
+    RecordedPacket* packet_record_buffer = NULL;
+    int recorded_packet_count = 0;
+
+    if (record_mode) {
+        packet_record_buffer = malloc(sizeof(RecordedPacket) * MAX_RECORDED_PACKETS);
+        if (!packet_record_buffer) {
+            printf("Warning: Could not allocate memory for packet recording! Recording disabled.\n");
+            record_mode = 0;
+        } else {
+            printf("RECORD MODE ENABLED: Capturing up to %d DATA packets in RAM.\n", MAX_RECORDED_PACKETS);
+        }
+    }
 
     struct timespec start_time, end_time;
     uint64_t total_analyze_time_ns = 0;
@@ -305,6 +352,10 @@ void run_main_decoder_loop(int debug_mode) {
         printf("STATE: WAIT ACTIVITY. DEBUG 2 ENABLED: Waiting for SYNC.\n");
     } else {
         printf("STATE: WAIT ACTIVITY. Waiting for line activity...\n");
+        // Tip for the user regarding speed
+        if (!record_mode) {
+            printf("(Tip: Printing to screen takes time. Use --record for high-speed continuous capture).\n");
+        }
     }
 
     while (keep_running) {
@@ -322,33 +373,42 @@ void run_main_decoder_loop(int debug_mode) {
                         debug_count = 0;
                     } else if (state == STATE_ANALYZE) {
                         bit_count = 0; 
-                        consecutive_ones = 0; // Initialize unstuffing counter for the new packet
+                        consecutive_ones = 0; 
                     }
                     break;
                     
                 case STATE_ANALYZE:
                     {
-                        // Passed the address of consecutive_ones
                         DecoderState next_state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count, &keep_running, &consecutive_ones);
                         
-                        // Check if we finished reading the current packet (SE0 or Error detected)
+                        // Check if we finished reading the current packet
                         if (next_state == STATE_WAIT_ACTIVITY) {
-                            
                             if (bit_count > 0) {
-                                // Extract the packet information locally in main
                                 UsbPacket pkt_info = analyze_usb_packet(bit_buffer, bit_count);
                                 
-                                // Only display the output if it is a DATA packet
                                 if (pkt_info.type == PKT_TYPE_DATA) {
+                                    // Print to screen if not recording (to save time) or if desired
                                     print_decoded_bits(bit_buffer, bit_count);
-                                    print_usb_packet(&pkt_info, 0); // Call the dedicated print function
+                                    print_usb_packet(&pkt_info, 0); 
+                                    
+                                    // Extremely fast RAM save operation
+                                    if (record_mode && recorded_packet_count < MAX_RECORDED_PACKETS) {
+                                        memcpy(packet_record_buffer[recorded_packet_count].bits, bit_buffer, bit_count);
+                                        packet_record_buffer[recorded_packet_count].bit_count = bit_count;
+                                        recorded_packet_count++;
+                                        
+                                        if (recorded_packet_count == MAX_RECORDED_PACKETS) {
+                                            printf("Record buffer FULL! Stopping capture.\n");
+                                            keep_running = 0;
+                                        }
+                                    }
                                 }
                             }
-                            
                             bit_count = 0;    
-                            keep_running = 1; 
+                            if (recorded_packet_count < MAX_RECORDED_PACKETS) {
+                                keep_running = 1; 
+                            }
                         }
-                        
                         state = next_state;
                     }
                     break;
@@ -368,6 +428,13 @@ void run_main_decoder_loop(int debug_mode) {
     }
 
     smi_manager_cleanup();
+    
+    // Defer the extremely slow file I/O until the hardware has stopped
+    if (record_mode && packet_record_buffer) {
+        flush_records_to_file(packet_record_buffer, recorded_packet_count);
+        free(packet_record_buffer);
+    }
+    
     print_performance_metrics(total_analyze_time_ns, symbols_analyzed_count);
     output_decoder_results(debug_mode, debug_buffer, debug_count, bit_buffer, bit_count);
 }
@@ -376,19 +443,24 @@ void run_main_decoder_loop(int debug_mode) {
  * APPLICATION ENTRY POINT
  * ========================================================= */
 
-int parse_arguments(int argc, char *argv[]) {
+int parse_arguments(int argc, char *argv[], int* record_mode) {
+    int debug_mode = -1; // Normal Mode
+    *record_mode = 0;    // Default is off
+    
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--debug1") == 0) return 1;
-        if (strcmp(argv[i], "--debug2") == 0) return 2;
+        if (strcmp(argv[i], "--debug1") == 0) debug_mode = 1;
+        else if (strcmp(argv[i], "--debug2") == 0) debug_mode = 2;
+        else if (strcmp(argv[i], "--record") == 0) *record_mode = 1;
     }
-    return -1; // Normal Mode
+    return debug_mode;
 }
 
 int main(int argc, char *argv[]) {
     printf("--- SMI Logic Analyzer: Multi-Stage Packet Decoder ---\n");
     signal(SIGINT, handle_sigint);
     
-    int debug_mode = parse_arguments(argc, argv);
+    int record_mode = 0;
+    int debug_mode = parse_arguments(argc, argv, &record_mode);
 
     if (smi_manager_init(2000000) != 0) {
         return -1;
@@ -397,7 +469,7 @@ int main(int argc, char *argv[]) {
     if (debug_mode == 1) {
         run_debug1_fast_path();
     } else {
-        run_main_decoder_loop(debug_mode);
+        run_main_decoder_loop(debug_mode, record_mode);
     }
 
     return 0;

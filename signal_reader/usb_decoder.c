@@ -119,40 +119,44 @@ UsbPacket analyze_usb_packet(const uint8_t* pkt, int len) {
     return packet;
 }
 
-void print_usb_packet(const UsbPacket* packet, int print_binary) {
+void fprint_usb_packet(FILE* stream, const UsbPacket* packet, int print_binary) {
     if (!packet->is_valid_length) {
-        printf("\n--- USB Packet Analysis: Error - Too short (%d bits) ---\n", packet->total_length);
+        fprintf(stream, "\n--- USB Packet Analysis: Error - Too short (%d bits) ---\n", packet->total_length);
         return;
     }
 
-    printf("\n========= USB PACKET ANALYSIS =========\n");
-    printf("PID:   %s\n", packet->pid_name);
+    fprintf(stream, "\n========= USB PACKET ANALYSIS =========\n");
+    fprintf(stream, "PID:   %s\n", packet->pid_name);
 
     if (packet->type == PKT_TYPE_TOKEN) {
-        printf("ADDR:  %d\n", packet->addr);
-        printf("ENDP:  %d\n", packet->endp);
-        printf("CRC5:  0x%02X (%s)\n", packet->crc5_received, (packet->crc5_valid) ? "VALID" : "INVALID");
+        fprintf(stream, "ADDR:  %d\n", packet->addr);
+        fprintf(stream, "ENDP:  %d\n", packet->endp);
+        fprintf(stream, "CRC5:  0x%02X (%s)\n", packet->crc5_received, (packet->crc5_valid) ? "VALID" : "INVALID");
     }
     else if (packet->type == PKT_TYPE_DATA) {
-        printf("DATA:  ");
+        fprintf(stream, "DATA:  ");
         if (print_binary) {
             for(int i = 0; i < packet->data_bits_len; i++) {
-                printf("%d", packet->data_bits[i]);
+                fprintf(stream, "%d", packet->data_bits[i]);
             }
         } else {
             for(int i = 0; i < packet->data_bits_len; i += 8) {
                 int bits_to_read = (packet->data_bits_len - i >= 8) ? 8 : (packet->data_bits_len - i);
                 uint8_t byte_val = extract_bits_lsb_first(packet->data_bits, i, bits_to_read);
-                printf("%02X ", byte_val);
+                fprintf(stream, "%02X ", byte_val);
             }
         }
-        printf("\nCRC16: 0x%04X (%s)\n", packet->crc16_received, (packet->crc16_valid) ? "VALID" : "INVALID");
+        fprintf(stream, "\nCRC16: 0x%04X (%s)\n", packet->crc16_received, (packet->crc16_valid) ? "VALID" : "INVALID");
     }
     else if (packet->type == PKT_TYPE_HANDSHAKE) {
         // Handshakes only contain a PID, nothing extra to print
     }
     else {
-        printf("Payload: Unknown or Raw bits\n");
+        fprintf(stream, "Payload: Unknown or Raw bits\n");
     }
-    printf("=======================================\n\n");
+    fprintf(stream, "=======================================\n\n");
+}
+
+void print_usb_packet(const UsbPacket* packet, int print_binary) {
+    fprint_usb_packet(stdout, packet, print_binary);
 }
