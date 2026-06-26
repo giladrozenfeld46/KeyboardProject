@@ -105,7 +105,7 @@ void export_and_plot_symbols(Symbol* buffer, int count) {
 
     fprintf(fp, "Index,DPlus,DMinus\n");
     for (int i = 0; i < count; i++) {
-        fprintf(fp, "%d,%d,%d\n", i, buffer[i].dplus, buffer[i].dminus);
+        fprintf(fp, "%d,%d,%d\n", i, buffer[i].dminus, buffer[i].dplus);
     }
     fclose(fp);
 
