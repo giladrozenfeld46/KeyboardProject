@@ -108,7 +108,7 @@ void export_and_plot_samples(uint32_t* buffer, int count) {
     for (int i = 0; i < count; i++) {
         int dplus = (buffer[i] & DPLUS_BIT_MASK) ? 1 : 0;
         int dminus = (buffer[i] & DMINUS_BIT_MASK) ? 1 : 0;
-        fprintf(fp, "%d,%d,%d\n", i, dplus, dminus);
+        fprintf(fp, "%d,%d,%d\n", i, dminus, dplus);
     }
     fclose(fp);
 
