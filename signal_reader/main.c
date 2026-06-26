@@ -168,7 +168,7 @@ DecoderState handle_state_debug(Symbol sym, Symbol* debug_buffer, int* debug_cou
     debug_buffer[(*debug_count)++] = sym;
 
     // Stop if we reached the desired count or detected SE0 (End of Packet)
-    if (*debug_count >= DEBUG_SYMBOLS_COUNT || (sym.dplus == 0 && sym.dminus == 0)) {
+    if (*debug_count >= DEBUG_SYMBOLS_COUNT) {
         if (sym.dplus == 0 && sym.dminus == 0) {
             printf("SE0 (End of Packet) detected during debug collection.\n");
         } else {
