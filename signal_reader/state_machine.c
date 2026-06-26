@@ -8,9 +8,6 @@ int is_symbol_equal(Symbol a, Symbol b) {
 DecoderState handle_state_wait_activity(Symbol sym, Symbol* sync_buffer) {
     // Check for unusual activity: D+ going high
     if (sym.dplus == 1) {
-        printf("Unusual line activity detected (D+ HIGH)!\n");
-        printf("Switching to SYNC SEARCH state...\n");
-        
         // Push this first symbol into the shift register! 
         // This prevents the first SYNC symbol from being consumed and lost.
         for (int i = 0; i < 7; i++) {
@@ -41,15 +38,12 @@ DecoderState handle_state_sync_search(Symbol sym, Symbol* sync_buffer, const Sym
     }
 
     if (match) {
-        printf("SYNC pattern detected!\n");
         // The reference for the first NRZI comparison is the last symbol of the SYNC
         *out_prev_symbol = sync_buffer[7]; 
         
         if (debug_mode == 2) {
-            printf("Switching to DEBUG state...\n");
             return STATE_DEBUG;
         }
-        printf("Switching to ANALYZE state...\n");
         return STATE_ANALYZE; 
     }
 
@@ -73,11 +67,9 @@ DecoderState handle_state_debug(Symbol sym, Symbol* debug_buffer, int* debug_cou
     return STATE_DEBUG; // Stay in debug mode
 }
 
-DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_buffer, int* bit_count, volatile int* keep_running) {
+DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_buffer, int* bit_count, volatile int* keep_running, int* consecutive_ones) {
     // End of Packet Detection: Both lines LOW (SE0)
     if (sym.dplus == 0 && sym.dminus == 0) {
-        printf("SE0 (End of Packet) detected! Stopping analysis.\n");
-        *keep_running = 0; // Signal the main loop to stop
         return STATE_WAIT_ACTIVITY;
     }
 
@@ -89,12 +81,30 @@ DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_
         current_bit = 1;
     }
 
-    // Save the decoded bit
+    // USB Bit Unstuffing Logic
+    if (current_bit == 1) {
+        (*consecutive_ones)++;
+        if (*consecutive_ones == 7) {
+            printf("\n[ERROR] Bit stuffing violation (7 consecutive 1s)! Aborting packet.\n");
+            return STATE_WAIT_ACTIVITY;
+        }
+    } else { // current_bit == 0
+        if (*consecutive_ones == 6) {
+            // This is a stuffed bit! Ignore it.
+            *consecutive_ones = 0; // Reset counter
+            *prev_symbol = sym;    // Update prev_symbol to the new physical state
+            return STATE_ANALYZE;  // Skip saving this bit to the buffer
+        }
+        // Normal 0 bit
+        *consecutive_ones = 0;
+    }
+
+    // Save the valid decoded bit
     if (*bit_count < MAX_DECODED_BITS) {
         bit_buffer[(*bit_count)++] = current_bit;
     } else {
         printf("Warning: Max bit buffer reached! Stopping early.\n");
-        *keep_running = 0;
+        return STATE_WAIT_ACTIVITY;
     }
 
     // Update previous symbol for the next iteration

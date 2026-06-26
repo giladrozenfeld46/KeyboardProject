@@ -46,8 +46,8 @@ DecoderState handle_state_debug(Symbol sym, Symbol* debug_buffer, int* debug_cou
 
 /**
  * Handles the ANALYZE state logic.
- * Decodes NRZI symbols into bits and detects End of Packet (SE0).
+ * Decodes NRZI symbols into bits, detects End of Packet (SE0), and handles USB Bit Unstuffing.
  */
-DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_buffer, int* bit_count, volatile int* keep_running);
+DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_buffer, int* bit_count, volatile int* keep_running, int* consecutive_ones);
 
 #endif // STATE_MACHINE_H
