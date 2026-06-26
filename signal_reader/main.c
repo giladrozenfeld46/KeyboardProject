@@ -7,7 +7,7 @@
 #include "smi_manager.h"
 
 #define CHUNK_SIZE 8
-#define POST_TRIGGER_SYMBOLS 128
+#define MAX_DECODED_BITS 2048
 
 #define SAMPLES_PER_SYMBOL 6
 
@@ -27,24 +27,11 @@ typedef struct {
     uint8_t dminus;
 } Symbol;
 
-void export_and_plot(Symbol* buffer, int count) {
-    printf("Exporting %d post-trigger symbols...\n", count);
-    FILE *fp = fopen("waveform.csv", "w");
-    if (!fp) {
-        printf("Error: Cannot create waveform.csv\n");
-        return;
-    }
-
-    fprintf(fp, "Index,DPlus,DMinus\n");
-    
-    for (int i = 0; i < count; i++) {
-        fprintf(fp, "%d,%d,%d\n", i, buffer[i].dplus, buffer[i].dminus);
-    }
-    fclose(fp);
-
-    printf("Plotting graph...\n");
-    system("python3 plot_waveform.py");
-}
+// Define the State Machine states
+typedef enum {
+    STATE_IDLE,
+    STATE_ANALYZE
+} DecoderState;
 
 /**
  * Exclusively pulls chunks from SMI Manager and extracts valid symbols.
@@ -58,21 +45,17 @@ int get_next_symbol(Symbol* out_symbol) {
     static int consecutive_count = 0;
 
     while (keep_running) {
-        // Fetch a new chunk if we have processed all elements in the current chunk
         if (chunk_idx >= CHUNK_SIZE) {
             while (keep_running && !smi_manager_read_chunk(chunk)) {
-                usleep(1); // Wait for hardware to provide data
+                usleep(1); 
             }
             if (!keep_running) return 0;
             chunk_idx = 0;
         }
 
         uint32_t val = chunk[chunk_idx++];
-        
-        // Mask to focus only on D+ and D- bits
         uint32_t masked_val = val & (DPLUS_BIT_MASK | DMINUS_BIT_MASK);
 
-        // Initialize state on the very first valid sample
         if (current_val == 0xFFFFFFFF) {
             current_val = masked_val;
             consecutive_count = 1;
@@ -82,19 +65,13 @@ int get_next_symbol(Symbol* out_symbol) {
         if (masked_val == current_val) {
             consecutive_count++;
             
-            // Passed enough samples to be considered a stable symbol
             if (consecutive_count >= SAMPLES_PER_SYMBOL) {
                 out_symbol->dplus = (masked_val & DPLUS_BIT_MASK) ? 1 : 0;
                 out_symbol->dminus = (masked_val & DMINUS_BIT_MASK) ? 1 : 0;
-                
-                // Reset counter to correctly detect the next symbol 
-                // (whether it's an identical repeating symbol or a new one)
                 consecutive_count = 0; 
                 return 1;
             }
         } else {
-            // Signal changed before a full symbol period was reached.
-            // Reset synchronization to align with the new edge and ignore previous unstable samples.
             current_val = masked_val;
             consecutive_count = 1;
         }
@@ -102,61 +79,151 @@ int get_next_symbol(Symbol* out_symbol) {
     return 0;
 }
 
+/**
+ * Helper to check if two symbols are logically identical
+ */
+int is_symbol_equal(Symbol a, Symbol b) {
+    return (a.dplus == b.dplus) && (a.dminus == b.dminus);
+}
+
+/**
+ * Prints the collected bits array in groups of 8 for readability
+ */
+void print_decoded_bits(uint8_t* bits, int count) {
+    printf("\n--- Decoded NRZI Bits (%d bits) ---\n", count);
+    for (int i = 0; i < count; i++) {
+        printf("%d", bits[i]);
+        if ((i + 1) % 8 == 0) {
+            printf(" "); // Space after every byte
+        }
+        if ((i + 1) % 64 == 0) {
+            printf("\n"); // Newline after 64 bits
+        }
+    }
+    printf("\n-----------------------------------\n");
+}
+
+/**
+ * Handles the IDLE state logic. 
+ * Looks for the SYNC pattern in the incoming symbols.
+ */
+DecoderState handle_state_idle(Symbol sym, Symbol* sync_buffer, const Symbol* expected_sync, Symbol* out_prev_symbol) {
+    // Shift the new symbol into the 8-symbol buffer (Shift Register)
+    for (int i = 0; i < 7; i++) {
+        sync_buffer[i] = sync_buffer[i+1];
+    }
+    sync_buffer[7] = sym;
+
+    // Check if the current buffer matches the expected sequence
+    int match = 1;
+    for (int i = 0; i < 8; i++) {
+        if (!is_symbol_equal(sync_buffer[i], expected_sync[i])) {
+            match = 0;
+            break;
+        }
+    }
+
+    if (match) {
+        printf("SYNC pattern detected! Switching to ANALYZE state.\n");
+        // The reference for the first NRZI comparison is the last symbol of the SYNC
+        *out_prev_symbol = sync_buffer[7]; 
+        return STATE_ANALYZE;
+    }
+
+    return STATE_IDLE; // Keep waiting
+}
+
+/**
+ * Handles the ANALYZE state logic.
+ * Decodes NRZI symbols into bits and detects End of Packet (SE0).
+ */
+DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_buffer, int* bit_count) {
+    // End of Packet Detection: Both lines LOW (SE0)
+    if (sym.dplus == 0 && sym.dminus == 0) {
+        printf("SE0 (End of Packet) detected! Stopping analysis.\n");
+        keep_running = 0; // Signal the main loop to stop
+        return STATE_IDLE;
+    }
+
+    // NRZI Decoding Logic:
+    // Transition (change) -> 0
+    // No transition (same) -> 1
+    uint8_t current_bit;
+    if (!is_symbol_equal(sym, *prev_symbol)) {
+        current_bit = 0;
+    } else {
+        current_bit = 1;
+    }
+
+    // Save the decoded bit
+    if (*bit_count < MAX_DECODED_BITS) {
+        bit_buffer[(*bit_count)++] = current_bit;
+    } else {
+        printf("Warning: Max bit buffer reached! Stopping early.\n");
+        keep_running = 0;
+    }
+
+    // Update previous symbol for the next iteration
+    *prev_symbol = sym;
+    
+    return STATE_ANALYZE; // Stay in analysis mode
+}
+
 int main() {
-    printf("--- SMI Logic Analyzer: Symbol Synchronizer & Decoder ---\n");
+    printf("--- SMI Logic Analyzer: Modular State Machine Decoder ---\n");
     signal(SIGINT, handle_sigint);
     
-    // Initialize the SMI hardware (e.g., 2 MSPS)
     if (smi_manager_init(2000000) != 0) {
         return -1;
     }
 
-    Symbol post_trigger_buffer[POST_TRIGGER_SYMBOLS];
-    
-    int collected = 0;
-    int triggered = 0;
+    DecoderState state = STATE_IDLE;
     Symbol sym;
+    
+    // Arrays and trackers for IDLE state
+    Symbol sync_buffer[8] = {{0, 0}}; 
+    
+    // Usually in USB (Full Speed): K J K J K J K K
+    Symbol expected_sync[8] = {
+        {0, 1}, {1, 0}, {0, 1}, {1, 0}, 
+        {0, 1}, {1, 0}, {0, 1}, {0, 1}
+    };
 
-    printf("Waiting for RISING EDGE on D+ (Symbol Level)...\n");
+    // Arrays and trackers for ANALYZE state
+    uint8_t bit_buffer[MAX_DECODED_BITS];
+    int bit_count = 0;
+    Symbol prev_symbol = {0, 0};
 
+    printf("STATE: IDLE. Waiting for 8-symbol SYNC pattern...\n");
+
+    // The clean main loop
     while (keep_running) {
-        // get_next_symbol is now the EXCLUSIVE consumer of smi_manager_read_chunk
         if (get_next_symbol(&sym)) {
             
-            if (!triggered) {
-                // STATE 1: Searching for the trigger (D+ goes HIGH)
-                if (sym.dplus == 1) {
-                    triggered = 1;
-                    printf("Triggered! Collecting next %d symbols...\n", POST_TRIGGER_SYMBOLS);
-                    post_trigger_buffer[collected++] = sym;
-                }
-            } else {
-                // STATE 2: Trigger occurred, collect decoded symbols sequentially
-                post_trigger_buffer[collected++] = sym;
-                
-                // Stop the main loop if we have collected exactly what we need
-                if (collected >= POST_TRIGGER_SYMBOLS) {
-                    break; 
-                }
+            switch (state) {
+                case STATE_IDLE:
+                    state = handle_state_idle(sym, sync_buffer, expected_sync, &prev_symbol);
+                    if (state == STATE_ANALYZE) {
+                        bit_count = 0; // Reset bit counter upon entering ANALYZE
+                    }
+                    break;
+                    
+                case STATE_ANALYZE:
+                    state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count);
+                    break;
             }
+            
         }
     }
 
     // Stop hardware and unmap memory safely
     smi_manager_cleanup();
 
-    // Plot and print if we successfully collected the post-trigger data
-    if (triggered && collected > 0) {
-        export_and_plot(post_trigger_buffer, collected);
-        
-        printf("\n--- Decoded Symbols ---\n");
-        for (int i = 0; i < collected; i++) {
-            printf("Symbol %3d: D+ = %d, D- = %d\n", i, post_trigger_buffer[i].dplus, post_trigger_buffer[i].dminus);
-        }
-        printf("--------------------------\n");
-        
+    // Print the extracted bits if we successfully captured any
+    if (bit_count > 0) {
+        print_decoded_bits(bit_buffer, bit_count);
     } else {
-        printf("Aborted before trigger was found or collection was complete.\n");
+        printf("No data was decoded.\n");
     }
 
     return 0;
