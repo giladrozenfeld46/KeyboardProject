@@ -132,10 +132,20 @@ void print_decoded_bits(uint8_t* bits, int count) {
 
 /**
  * Handles the IDLE state logic. 
- * Looks for the SYNC pattern in the incoming symbols.
+ * If in debug mode, it looks for the first D+ HIGH.
+ * Otherwise, it looks for the SYNC pattern in the incoming symbols.
  */
-DecoderState handle_state_idle(Symbol sym, Symbol* sync_buffer, const Symbol* expected_sync, Symbol* out_prev_symbol) {
-    // Shift the new symbol into the 8-symbol buffer (Shift Register)
+DecoderState handle_state_idle(Symbol sym, Symbol* sync_buffer, const Symbol* expected_sync, Symbol* out_prev_symbol, int debug_mode) {
+    if (debug_mode) {
+        // In debug mode, trigger immediately when D+ goes HIGH
+        if (sym.dplus == 1) {
+            printf("Initial D+ HIGH detected! Switching to DEBUG state...\n");
+            return STATE_DEBUG;
+        }
+        return STATE_IDLE; // Keep waiting for initial trigger
+    }
+
+    // Normal execution: Shift the new symbol into the 8-symbol buffer (Shift Register)
     for (int i = 0; i < 7; i++) {
         sync_buffer[i] = sync_buffer[i+1];
     }
@@ -151,10 +161,10 @@ DecoderState handle_state_idle(Symbol sym, Symbol* sync_buffer, const Symbol* ex
     }
 
     if (match) {
-        printf("SYNC pattern detected! Switching state...\n");
+        printf("SYNC pattern detected! Switching to ANALYZE state...\n");
         // The reference for the first NRZI comparison is the last symbol of the SYNC
         *out_prev_symbol = sync_buffer[7]; 
-        return STATE_ANALYZE; // The main loop will decide if we go to ANALYZE or DEBUG based on the macro
+        return STATE_ANALYZE; 
     }
 
     return STATE_IDLE; // Keep waiting
@@ -259,9 +269,10 @@ int main(int argc, char *argv[]) {
     uint64_t total_analyze_time_ns = 0;
     uint64_t symbols_analyzed_count = 0;
 
-    printf("STATE: IDLE. Waiting for 8-symbol SYNC pattern...\n");
     if (debug_mode) {
-        printf("DEBUG MODE ENABLED: Will collect %d raw symbols after SYNC.\n", DEBUG_SYMBOLS_COUNT);
+        printf("STATE: IDLE. DEBUG MODE ENABLED: Waiting for D+ to go HIGH, then collecting %d raw symbols.\n", DEBUG_SYMBOLS_COUNT);
+    } else {
+        printf("STATE: IDLE. Waiting for 8-symbol SYNC pattern...\n");
     }
 
     // The clean main loop
@@ -273,17 +284,12 @@ int main(int argc, char *argv[]) {
             
             switch (state) {
                 case STATE_IDLE:
-                    // If handle_state_idle returns STATE_ANALYZE, it means we found the SYNC
-                    if (handle_state_idle(sym, sync_buffer, expected_sync, &prev_symbol) == STATE_ANALYZE) {
-                        if (debug_mode) {
-                            state = STATE_DEBUG;
-                            debug_count = 0;
-                            printf("Switching to DEBUG state.\n");
-                        } else {
-                            state = STATE_ANALYZE;
-                            bit_count = 0; // Reset bit counter upon entering ANALYZE
-                            printf("Switching to ANALYZE state.\n");
-                        }
+                    state = handle_state_idle(sym, sync_buffer, expected_sync, &prev_symbol, debug_mode);
+                    if (state == STATE_DEBUG) {
+                        debug_count = 0;
+                        // First debug symbol collection is handled in the next loop iteration
+                    } else if (state == STATE_ANALYZE) {
+                        bit_count = 0; // Reset bit counter upon entering ANALYZE
                     }
                     break;
                     
