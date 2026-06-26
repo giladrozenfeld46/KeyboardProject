@@ -10,10 +10,10 @@
 #define CHUNK_SIZE 8
 #define POST_TRIGGER_SAMPLES 1024
 
-// Assuming D+ is connected to GPIO8 (Bit 0). Change the shift if it's on a different pin.
-#define DPLUS_BIT_MASK (1 << 0) 
-// Assuming D- is connected to GPIO9 (Bit 1)
-#define DMINUS_BIT_MASK (1 << 1)
+// Assuming D+ is connected to GPIO0 (Bit 0). Change the shift if it's on a different pin.
+#define DPLUS_BIT_MASK (1 << 1) 
+// Assuming D- is connected to GPIO8 (Bit 1)
+#define DMINUS_BIT_MASK (1 << 0)
 
 volatile int keep_running = 1;
 
