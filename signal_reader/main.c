@@ -276,7 +276,6 @@ void output_decoder_results(int debug_mode, Symbol* debug_buffer, int debug_coun
     }
 }
 
-
 void run_main_decoder_loop(int debug_mode) {
     DecoderState state = STATE_WAIT_ACTIVITY;
     Symbol sym;
@@ -336,8 +335,14 @@ void run_main_decoder_loop(int debug_mode) {
                         if (next_state == STATE_WAIT_ACTIVITY) {
                             
                             if (bit_count > 0) {
-                                print_decoded_bits(bit_buffer, bit_count);
-                                analyze_usb_packet(bit_buffer, bit_count, 0); 
+                                // Extract the packet information locally in main
+                                UsbPacket pkt_info = analyze_usb_packet(bit_buffer, bit_count);
+                                
+                                // Only display the output if it is a DATA packet
+                                if (pkt_info.type == PKT_TYPE_DATA) {
+                                    print_decoded_bits(bit_buffer, bit_count);
+                                    print_usb_packet(&pkt_info, 0); // Call the dedicated print function
+                                }
                             }
                             
                             bit_count = 0;    
