@@ -413,7 +413,7 @@ void run_main_decoder_loop(int debug_mode, int record_mode) {
                             
                             if (record_mode && transaction_record_buffer) {
                                 // Smart Transaction Recording Logic
-                                if (pkt_info.type == PKT_TYPE_TOKEN && (pkt_info.pid_val == 0x96 /*IN*/ || pkt_info.pid_val == 0x87 /*OUT*/)) {
+                                if (pkt_info.type == PKT_TYPE_TOKEN) {
                                     // Store the token and wait to see if DATA follows
                                     memcpy(pending_token_bits, bit_buffer, bit_count);
                                     pending_token_bit_count = bit_count;
