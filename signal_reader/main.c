@@ -93,6 +93,27 @@ int is_symbol_equal(Symbol a, Symbol b) {
 }
 
 /**
+ * Exports the collected symbols to a CSV file and plots them using a Python script
+ */
+void export_and_plot_symbols(Symbol* buffer, int count) {
+    printf("Exporting %d debug symbols to CSV...\n", count);
+    FILE *fp = fopen("waveform.csv", "w");
+    if (!fp) {
+        printf("Error: Cannot create waveform.csv\n");
+        return;
+    }
+
+    fprintf(fp, "Index,DPlus,DMinus\n");
+    for (int i = 0; i < count; i++) {
+        fprintf(fp, "%d,%d,%d\n", i, buffer[i].dplus, buffer[i].dminus);
+    }
+    fclose(fp);
+
+    printf("Plotting graph...\n");
+    system("python3 plot_waveform.py");
+}
+
+/**
  * Prints the collected bits array in groups of 8 for readability
  */
 void print_decoded_bits(uint8_t* bits, int count) {
@@ -306,6 +327,9 @@ int main(int argc, char *argv[]) {
                 printf("Symbol %3d: D+ = %d, D- = %d\n", i, debug_buffer[i].dplus, debug_buffer[i].dminus);
             }
             printf("-------------------------------\n");
+            
+            // Export to CSV and plot the graph
+            export_and_plot_symbols(debug_buffer, debug_count);
         } else {
             printf("No debug symbols were collected.\n");
         }
