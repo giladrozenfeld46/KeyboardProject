@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h> // Required for high-resolution timing
 
 #include "smi_manager.h"
 
@@ -194,11 +195,19 @@ int main() {
     int bit_count = 0;
     Symbol prev_symbol = {0, 0};
 
+    // Performance metrics variables
+    struct timespec start_time, end_time;
+    uint64_t total_analyze_time_ns = 0;
+    uint64_t symbols_analyzed_count = 0;
+
     printf("STATE: IDLE. Waiting for 8-symbol SYNC pattern...\n");
 
     // The clean main loop
     while (keep_running) {
         if (get_next_symbol(&sym)) {
+            
+            // Start measuring the state machine processing time
+            clock_gettime(CLOCK_MONOTONIC, &start_time);
             
             switch (state) {
                 case STATE_IDLE:
@@ -213,11 +222,28 @@ int main() {
                     break;
             }
             
+            // Stop measuring the processing time
+            clock_gettime(CLOCK_MONOTONIC, &end_time);
+            
+            uint64_t ns_spent = (end_time.tv_sec - start_time.tv_sec) * 1000000000ULL + 
+                                (end_time.tv_nsec - start_time.tv_nsec);
+            total_analyze_time_ns += ns_spent;
+            symbols_analyzed_count++;
+            
         }
     }
 
     // Stop hardware and unmap memory safely
     smi_manager_cleanup();
+
+    // Print Performance Metrics
+    printf("\n--- Performance Metrics ---\n");
+    printf("Total symbols analyzed: %llu\n", (unsigned long long)symbols_analyzed_count);
+    if (symbols_analyzed_count > 0) {
+        double avg_analyze_time = (double)total_analyze_time_ns / symbols_analyzed_count;
+        printf("Average time to analyze a symbol (State Machine logic): %.2f ns\n", avg_analyze_time);
+    }
+    printf("---------------------------\n");
 
     // Print the extracted bits if we successfully captured any
     if (bit_count > 0) {
