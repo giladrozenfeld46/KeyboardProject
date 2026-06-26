@@ -2,6 +2,7 @@
 #define USB_DECODER_H
 
 #include <stdint.h>
+#include <stdio.h> // Added for FILE*
 
 // Define general packet types based on PID
 typedef enum {
@@ -45,10 +46,18 @@ typedef struct {
 UsbPacket analyze_usb_packet(const uint8_t* pkt, int len);
 
 /**
- * Prints the content of a decoded UsbPacket struct.
+ * Prints the content of a decoded UsbPacket struct directly to stdout.
  * @param packet Pointer to the UsbPacket struct
  * @param print_binary Set to 1 to print data payload as binary, 0 for Hex
  */
 void print_usb_packet(const UsbPacket* packet, int print_binary);
+
+/**
+ * Core printing logic that writes a decoded UsbPacket to a given FILE stream.
+ * @param stream Target FILE pointer (e.g., stdout or an opened file)
+ * @param packet Pointer to the UsbPacket struct
+ * @param print_binary Set to 1 to print data payload as binary, 0 for Hex
+ */
+void fprint_usb_packet(FILE* stream, const UsbPacket* packet, int print_binary);
 
 #endif // USB_DECODER_H
