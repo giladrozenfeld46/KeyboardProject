@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <time.h> // Required for high-resolution timing
+#include <string.h> // Required for strcmp
 
 #include "smi_manager.h"
 
@@ -11,6 +12,9 @@
 #define MAX_DECODED_BITS 2048
 
 #define SAMPLES_PER_SYMBOL 6
+
+// Debug configurations
+#define DEBUG_SYMBOLS_COUNT 128 // Number of raw symbols to collect in debug mode
 
 // Assuming D+ is connected to GPIO9 (Bit 1). Change the shift if it's on a different pin.
 #define DPLUS_BIT_MASK (1 << 1) 
@@ -31,7 +35,8 @@ typedef struct {
 // Define the State Machine states
 typedef enum {
     STATE_IDLE,
-    STATE_ANALYZE
+    STATE_ANALYZE,
+    STATE_DEBUG // New debug state for raw symbol collection
 } DecoderState;
 
 /**
@@ -125,13 +130,34 @@ DecoderState handle_state_idle(Symbol sym, Symbol* sync_buffer, const Symbol* ex
     }
 
     if (match) {
-        printf("SYNC pattern detected! Switching to ANALYZE state.\n");
+        printf("SYNC pattern detected! Switching state...\n");
         // The reference for the first NRZI comparison is the last symbol of the SYNC
         *out_prev_symbol = sync_buffer[7]; 
-        return STATE_ANALYZE;
+        return STATE_ANALYZE; // The main loop will decide if we go to ANALYZE or DEBUG based on the macro
     }
 
     return STATE_IDLE; // Keep waiting
+}
+
+/**
+ * Handles the DEBUG state logic.
+ * Collects a specified amount of raw symbols for debugging purposes.
+ */
+DecoderState handle_state_debug(Symbol sym, Symbol* debug_buffer, int* debug_count) {
+    debug_buffer[(*debug_count)++] = sym;
+
+    // Stop if we reached the desired count or detected SE0 (End of Packet)
+    if (*debug_count >= DEBUG_SYMBOLS_COUNT || (sym.dplus == 0 && sym.dminus == 0)) {
+        if (sym.dplus == 0 && sym.dminus == 0) {
+            printf("SE0 (End of Packet) detected during debug collection.\n");
+        } else {
+            printf("Collected %d debug symbols.\n", *debug_count);
+        }
+        keep_running = 0; // Signal the main loop to stop
+        return STATE_IDLE;
+    }
+
+    return STATE_DEBUG; // Stay in debug mode
 }
 
 /**
@@ -170,10 +196,18 @@ DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_
     return STATE_ANALYZE; // Stay in analysis mode
 }
 
-int main() {
+int main(int argc, char *argv[]) {
     printf("--- SMI Logic Analyzer: Modular State Machine Decoder ---\n");
     signal(SIGINT, handle_sigint);
     
+    int debug_mode = 0;
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug") == 0) {
+            debug_mode = 1;
+            break;
+        }
+    }
+
     if (smi_manager_init(2000000) != 0) {
         return -1;
     }
@@ -195,12 +229,19 @@ int main() {
     int bit_count = 0;
     Symbol prev_symbol = {0, 0};
 
+    // Arrays and trackers for DEBUG state
+    Symbol debug_buffer[DEBUG_SYMBOLS_COUNT];
+    int debug_count = 0;
+
     // Performance metrics variables
     struct timespec start_time, end_time;
     uint64_t total_analyze_time_ns = 0;
     uint64_t symbols_analyzed_count = 0;
 
     printf("STATE: IDLE. Waiting for 8-symbol SYNC pattern...\n");
+    if (debug_mode) {
+        printf("DEBUG MODE ENABLED: Will collect %d raw symbols after SYNC.\n", DEBUG_SYMBOLS_COUNT);
+    }
 
     // The clean main loop
     while (keep_running) {
@@ -211,14 +252,26 @@ int main() {
             
             switch (state) {
                 case STATE_IDLE:
-                    state = handle_state_idle(sym, sync_buffer, expected_sync, &prev_symbol);
-                    if (state == STATE_ANALYZE) {
-                        bit_count = 0; // Reset bit counter upon entering ANALYZE
+                    // If handle_state_idle returns STATE_ANALYZE, it means we found the SYNC
+                    if (handle_state_idle(sym, sync_buffer, expected_sync, &prev_symbol) == STATE_ANALYZE) {
+                        if (debug_mode) {
+                            state = STATE_DEBUG;
+                            debug_count = 0;
+                            printf("Switching to DEBUG state.\n");
+                        } else {
+                            state = STATE_ANALYZE;
+                            bit_count = 0; // Reset bit counter upon entering ANALYZE
+                            printf("Switching to ANALYZE state.\n");
+                        }
                     }
                     break;
                     
                 case STATE_ANALYZE:
                     state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count);
+                    break;
+
+                case STATE_DEBUG:
+                    state = handle_state_debug(sym, debug_buffer, &debug_count);
                     break;
             }
             
@@ -245,11 +298,24 @@ int main() {
     }
     printf("---------------------------\n");
 
-    // Print the extracted bits if we successfully captured any
-    if (bit_count > 0) {
-        print_decoded_bits(bit_buffer, bit_count);
+    // Output results based on the chosen mode
+    if (debug_mode) {
+        if (debug_count > 0) {
+            printf("\n--- Debug: Raw Symbols (%d) ---\n", debug_count);
+            for (int i = 0; i < debug_count; i++) {
+                printf("Symbol %3d: D+ = %d, D- = %d\n", i, debug_buffer[i].dplus, debug_buffer[i].dminus);
+            }
+            printf("-------------------------------\n");
+        } else {
+            printf("No debug symbols were collected.\n");
+        }
     } else {
-        printf("No data was decoded.\n");
+        // Print the extracted bits if we successfully captured any in normal mode
+        if (bit_count > 0) {
+            print_decoded_bits(bit_buffer, bit_count);
+        } else {
+            printf("No data was decoded.\n");
+        }
     }
 
     return 0;
