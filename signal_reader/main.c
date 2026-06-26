@@ -7,16 +7,15 @@
 #include <string.h> 
 
 #include "smi_manager.h"
+#include "state_machine.h"
 
 #define CHUNK_SIZE 8
-#define MAX_DECODED_BITS 2048
 
 // Symbol extraction configuration based on consecutive samples
 #define TARGET_SYMBOL_SAMPLES 6
 #define MIN_SYMBOL_SAMPLES 4
 
 // Debug configurations
-#define DEBUG_SYMBOLS_COUNT 128 
 #define DEBUG_SAMPLES_COUNT 1024 
 
 // Assuming D+ is connected to GPIO9 (Bit 1). Change the shift if it's on a different pin.
@@ -30,26 +29,13 @@ void handle_sigint(int sig) {
     keep_running = 0;
 }
 
-typedef struct {
-    uint8_t dplus;
-    uint8_t dminus;
-} Symbol;
-
-// Define the State Machine states
-typedef enum {
-    STATE_WAIT_ACTIVITY, // Wait for unusual voltage (D+ HIGH or D- LOW)
-    STATE_SYNC_SEARCH,   // Wait for the 8-symbol SYNC pattern
-    STATE_ANALYZE,       // Decode NRZI to bits
-    STATE_DEBUG          // Collect raw symbols for debugging (used by debug2)
-} DecoderState;
+/* =========================================================
+ * CORE HARDWARE SAMPLING & DIGITAL FILTERING
+ * ========================================================= */
 
 /**
  * Exclusively pulls chunks from SMI Manager and extracts valid symbols.
- * Uses a digital filter logic: 
- * If a value repeats TARGET_SYMBOL_SAMPLES times, it's a valid symbol.
- * If the value changes, but the previous value repeated at least MIN_SYMBOL_SAMPLES times, 
- * it emits the previous value and uses the new sample as the start of the next symbol.
- * This filters out line skew/glitches and handles slight frequency drifts gracefully.
+ * Uses a digital filter logic to discard noise and handle line skew.
  */
 int get_next_symbol(Symbol* out_symbol) {
     static uint32_t chunk[CHUNK_SIZE];
@@ -81,25 +67,18 @@ int get_next_symbol(Symbol* out_symbol) {
             if (consecutive_count >= TARGET_SYMBOL_SAMPLES) {
                 out_symbol->dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
                 out_symbol->dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
-                
-                // Reset to 0 so the next sample starts counting towards the next symbol
                 consecutive_count = 0; 
                 return 1;
             }
         } else {
-            // Signal edge detected!
+            // Signal edge detected
             if (consecutive_count >= MIN_SYMBOL_SAMPLES) {
-                // The previous state held long enough to be a valid symbol
                 out_symbol->dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
                 out_symbol->dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
-                
-                // Start tracking the new state immediately
                 current_val = masked_val;
                 consecutive_count = 1;
                 return 1;
             } else {
-                // The previous state was too short (noise, line skew glitch, or transition).
-                // Ignore it and start tracking the new state.
                 current_val = masked_val;
                 consecutive_count = 1;
             }
@@ -108,16 +87,10 @@ int get_next_symbol(Symbol* out_symbol) {
     return 0;
 }
 
-/**
- * Helper to check if two symbols are logically identical
- */
-int is_symbol_equal(Symbol a, Symbol b) {
-    return (a.dplus == b.dplus) && (a.dminus == b.dminus);
-}
+/* =========================================================
+ * EXPORT, PLOTTING, AND PRINTING UTILITIES
+ * ========================================================= */
 
-/**
- * Exports collected raw samples to a CSV file and plots them
- */
 void export_and_plot_samples(uint32_t* buffer, int count) {
     printf("Exporting %d raw samples to CSV...\n", count);
     FILE *fp = fopen("waveform.csv", "w");
@@ -138,9 +111,6 @@ void export_and_plot_samples(uint32_t* buffer, int count) {
     system("python3 plot_waveform.py");
 }
 
-/**
- * Exports the collected symbols to a CSV file and plots them
- */
 void export_and_plot_symbols(Symbol* buffer, int count) {
     printf("Exporting %d symbols to CSV...\n", count);
     FILE *fp = fopen("waveform.csv", "w");
@@ -159,37 +129,35 @@ void export_and_plot_symbols(Symbol* buffer, int count) {
     system("python3 plot_waveform.py");
 }
 
-/**
- * Prints the collected bits array in groups of 8 for readability
- */
 void print_decoded_bits(uint8_t* bits, int count) {
     printf("\n--- Decoded NRZI Bits (%d bits) ---\n", count);
     for (int i = 0; i < count; i++) {
         printf("%d", bits[i]);
-        if ((i + 1) % 8 == 0) {
-            printf(" "); 
-        }
-        if ((i + 1) % 64 == 0) {
-            printf("\n"); 
-        }
+        if ((i + 1) % 8 == 0) printf(" "); 
+        if ((i + 1) % 64 == 0) printf("\n"); 
     }
     printf("\n-----------------------------------\n");
 }
 
-/**
- * Handles the DEBUG 1 mode (Combined Fast Path)
- * Bypasses the state machine, collects raw samples on D+ HIGH, plots them, 
- * then processes those EXACT same samples to extract symbols and plots them too.
- */
-void run_debug1_fast_path() {
-    printf("DEBUG 1 ENABLED: Waiting for initial D+ HIGH to collect %d raw samples.\n", DEBUG_SAMPLES_COUNT);
-    
+void print_performance_metrics(uint64_t total_time, uint64_t total_symbols) {
+    printf("\n--- Performance Metrics ---\n");
+    printf("Total symbols processed: %llu\n", (unsigned long long)total_symbols);
+    if (total_symbols > 0) {
+        double avg_time = (double)total_time / total_symbols;
+        printf("Average processing time per symbol: %.2f ns\n", avg_time);
+    }
+    printf("---------------------------\n");
+}
+
+/* =========================================================
+ * DEBUG 1: RAW SAMPLES & OFFLINE EXTRACTION
+ * ========================================================= */
+
+int collect_raw_samples(uint32_t* sample_buffer) {
     uint32_t chunk[CHUNK_SIZE];
-    uint32_t sample_buffer[DEBUG_SAMPLES_COUNT];
     int collected = 0;
     int triggered = 0;
     
-    // Step 1: Collect Raw Samples
     while (keep_running && collected < DEBUG_SAMPLES_COUNT) {
         if (smi_manager_read_chunk(chunk)) {
             if (!triggered) {
@@ -197,7 +165,6 @@ void run_debug1_fast_path() {
                     if (chunk[i] & DPLUS_BIT_MASK) {
                         triggered = 1;
                         printf("Initial D+ HIGH detected! Collecting raw samples...\n");
-                        // Collect the rest of the current chunk
                         for (int j = i; j < CHUNK_SIZE && collected < DEBUG_SAMPLES_COUNT; j++) {
                             sample_buffer[collected++] = chunk[j];
                         }
@@ -213,298 +180,81 @@ void run_debug1_fast_path() {
             usleep(1);
         }
     }
+    return collected;
+}
+
+int extract_symbols_offline(uint32_t* sample_buffer, int collected, Symbol* debug_symbols) {
+    int sym_count = 0;
+    uint32_t current_val = 0xFFFFFFFF;
+    int consecutive_count = 0; 
     
-    smi_manager_cleanup();
+    for (int i = 0; i < collected; i++) {
+        uint32_t masked_val = sample_buffer[i] & (DPLUS_BIT_MASK | DMINUS_BIT_MASK);
+        
+        if (current_val == 0xFFFFFFFF) {
+            current_val = masked_val;
+            consecutive_count = 1;
+            continue;
+        }
+        
+        if (masked_val == current_val) {
+            consecutive_count++;
+            if (consecutive_count >= TARGET_SYMBOL_SAMPLES) {
+                debug_symbols[sym_count].dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
+                debug_symbols[sym_count].dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
+                sym_count++;
+                consecutive_count = 0; 
+                if (sym_count >= DEBUG_SYMBOLS_COUNT) break;
+            }
+        } else {
+            if (consecutive_count >= MIN_SYMBOL_SAMPLES) {
+                debug_symbols[sym_count].dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
+                debug_symbols[sym_count].dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
+                sym_count++;
+                current_val = masked_val;
+                consecutive_count = 1;
+                if (sym_count >= DEBUG_SYMBOLS_COUNT) break;
+            } else {
+                current_val = masked_val;
+                consecutive_count = 1;
+            }
+        }
+    }
+    return sym_count;
+}
+
+void run_debug1_fast_path() {
+    printf("DEBUG 1 ENABLED: Waiting for initial D+ HIGH to collect %d raw samples.\n", DEBUG_SAMPLES_COUNT);
+    uint32_t sample_buffer[DEBUG_SAMPLES_COUNT];
+    
+    int collected = collect_raw_samples(sample_buffer);
+    smi_manager_cleanup(); // Free hardware early, processing is now offline
     
     if (collected > 0) {
-        // Step 2: Plot Raw Samples
         printf("\nNOTE: The program will plot the raw samples first.\n");
         printf("CLOSE THE PLOT WINDOW to proceed to the symbol extraction graph!\n\n");
         export_and_plot_samples(sample_buffer, collected);
         
-        // Step 3: Extract Symbols (Offline processing of the collected samples)
         printf("\n--- Extracting Symbols from Captured Raw Samples ---\n");
         Symbol debug_symbols[DEBUG_SYMBOLS_COUNT];
-        int sym_count = 0;
-        uint32_t current_val = 0xFFFFFFFF;
-        int consecutive_count = 0; 
+        int sym_count = extract_symbols_offline(sample_buffer, collected, debug_symbols);
         
-        for (int i = 0; i < collected; i++) {
-            uint32_t masked_val = sample_buffer[i] & (DPLUS_BIT_MASK | DMINUS_BIT_MASK);
-            
-            if (current_val == 0xFFFFFFFF) {
-                current_val = masked_val;
-                consecutive_count = 1;
-                continue;
-            }
-            
-            if (masked_val == current_val) {
-                consecutive_count++;
-                if (consecutive_count >= TARGET_SYMBOL_SAMPLES) {
-                    debug_symbols[sym_count].dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
-                    debug_symbols[sym_count].dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
-                    sym_count++;
-                    consecutive_count = 0; 
-                    if (sym_count >= DEBUG_SYMBOLS_COUNT) break;
-                }
-            } else {
-                if (consecutive_count >= MIN_SYMBOL_SAMPLES) {
-                    debug_symbols[sym_count].dplus = (current_val & DPLUS_BIT_MASK) ? 1 : 0;
-                    debug_symbols[sym_count].dminus = (current_val & DMINUS_BIT_MASK) ? 1 : 0;
-                    sym_count++;
-                    current_val = masked_val;
-                    consecutive_count = 1;
-                    if (sym_count >= DEBUG_SYMBOLS_COUNT) break;
-                } else {
-                    current_val = masked_val;
-                    consecutive_count = 1;
-                }
-            }
-        }
-        
-        // Step 4: Plot Extracted Symbols
         if (sym_count > 0) {
             printf("Successfully extracted %d symbols. Plotting symbol graph...\n", sym_count);
             export_and_plot_symbols(debug_symbols, sym_count);
         } else {
             printf("Could not extract any stable symbols from the raw samples.\n");
         }
-        
     } else {
         printf("Aborted before collection finished.\n");
     }
 }
 
-/**
- * Handles the WAIT_ACTIVITY state logic.
- * Looks for an unusual voltage state (D+ is HIGH) to start analysis.
- * Injects the triggering symbol into the sync buffer so it's not missed.
- */
-DecoderState handle_state_wait_activity(Symbol sym, Symbol* sync_buffer) {
-    // Check for unusual activity: D+ going high
-    if (sym.dplus == 1) {
-        printf("Unusual line activity detected (D+ HIGH)!\n");
-        printf("Switching to SYNC SEARCH state...\n");
-        
-        // Push this first symbol into the shift register! 
-        // This prevents the first SYNC symbol from being consumed and lost.
-        for (int i = 0; i < 7; i++) {
-            sync_buffer[i] = sync_buffer[i+1];
-        }
-        sync_buffer[7] = sym;
-        
-        return STATE_SYNC_SEARCH;
-    }
-    
-    return STATE_WAIT_ACTIVITY; // Keep waiting
-}
+/* =========================================================
+ * MAIN STATE MACHINE DECODER FLOW
+ * ========================================================= */
 
-/**
- * Handles the SYNC_SEARCH state logic. 
- * Looks for the SYNC pattern in the incoming symbols.
- */
-DecoderState handle_state_sync_search(Symbol sym, Symbol* sync_buffer, const Symbol* expected_sync, Symbol* out_prev_symbol, int debug_mode) {
-    // Shift the new symbol into the 8-symbol buffer
-    for (int i = 0; i < 7; i++) {
-        sync_buffer[i] = sync_buffer[i+1];
-    }
-    sync_buffer[7] = sym;
-
-    // Check if the current buffer matches the expected sequence
-    int match = 1;
-    for (int i = 0; i < 8; i++) {
-        if (!is_symbol_equal(sync_buffer[i], expected_sync[i])) {
-            match = 0;
-            break;
-        }
-    }
-
-    if (match) {
-        printf("SYNC pattern detected!\n");
-        // The reference for the first NRZI comparison is the last symbol of the SYNC
-        *out_prev_symbol = sync_buffer[7]; 
-        
-        if (debug_mode == 2) {
-            printf("Switching to DEBUG state...\n");
-            return STATE_DEBUG;
-        }
-        printf("Switching to ANALYZE state...\n");
-        return STATE_ANALYZE; 
-    }
-
-    return STATE_SYNC_SEARCH; // Keep looking for SYNC
-}
-
-/**
- * Handles the DEBUG state logic (Used by debug2).
- * Collects a specified amount of raw symbols for debugging purposes.
- */
-DecoderState handle_state_debug(Symbol sym, Symbol* debug_buffer, int* debug_count) {
-    debug_buffer[(*debug_count)++] = sym;
-
-    // Stop if we reached the desired count or detected SE0 (End of Packet)
-    if (*debug_count >= DEBUG_SYMBOLS_COUNT) {
-        if (sym.dplus == 0 && sym.dminus == 0) {
-            printf("SE0 (End of Packet) detected during debug collection.\n");
-        } else {
-            printf("Collected %d debug symbols.\n", *debug_count);
-        }
-        keep_running = 0; // Signal the main loop to stop
-        return STATE_WAIT_ACTIVITY;
-    }
-
-    return STATE_DEBUG; // Stay in debug mode
-}
-
-/**
- * Handles the ANALYZE state logic.
- * Decodes NRZI symbols into bits and detects End of Packet (SE0).
- */
-DecoderState handle_state_analyze(Symbol sym, Symbol* prev_symbol, uint8_t* bit_buffer, int* bit_count) {
-    // End of Packet Detection: Both lines LOW (SE0)
-    if (sym.dplus == 0 && sym.dminus == 0) {
-        printf("SE0 (End of Packet) detected! Stopping analysis.\n");
-        keep_running = 0; // Signal the main loop to stop
-        return STATE_WAIT_ACTIVITY;
-    }
-
-    // NRZI Decoding Logic
-    uint8_t current_bit;
-    if (!is_symbol_equal(sym, *prev_symbol)) {
-        current_bit = 0;
-    } else {
-        current_bit = 1;
-    }
-
-    // Save the decoded bit
-    if (*bit_count < MAX_DECODED_BITS) {
-        bit_buffer[(*bit_count)++] = current_bit;
-    } else {
-        printf("Warning: Max bit buffer reached! Stopping early.\n");
-        keep_running = 0;
-    }
-
-    // Update previous symbol for the next iteration
-    *prev_symbol = sym;
-    
-    return STATE_ANALYZE; // Stay in analysis mode
-}
-
-int main(int argc, char *argv[]) {
-    printf("--- SMI Logic Analyzer: Multi-Stage Packet Decoder ---\n");
-    signal(SIGINT, handle_sigint);
-    
-    // -1 = Normal Mode, 1 = Raw Samples + Extracted Symbols, 2 = Raw Symbols after SYNC
-    int debug_mode = -1; 
-    
-    for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--debug1") == 0) {
-            debug_mode = 1;
-            break;
-        } else if (strcmp(argv[i], "--debug2") == 0) {
-            debug_mode = 2;
-            break;
-        }
-    }
-
-    if (smi_manager_init(2000000) != 0) {
-        return -1;
-    }
-
-    // Combined Fast Path: Captures samples, plots them, then extracts symbols and plots them too
-    if (debug_mode == 1) {
-        run_debug1_fast_path();
-        return 0; // Exit after debug sequence completes
-    }
-
-    DecoderState state = STATE_WAIT_ACTIVITY;
-    Symbol sym;
-    
-    // Arrays and trackers for SYNC_SEARCH state
-    Symbol sync_buffer[8] = {{0, 0}}; 
-    
-    // Usually in USB (Full Speed): K J K J K J K K
-    Symbol expected_sync[8] = {
-        {1, 0}, {0, 1}, {1, 0}, {0, 1}, 
-        {1, 0}, {0, 1}, {1, 0}, {1, 0}
-    };
-
-    // Arrays and trackers for ANALYZE state
-    uint8_t bit_buffer[MAX_DECODED_BITS];
-    int bit_count = 0;
-    Symbol prev_symbol = {0, 0};
-
-    // Arrays and trackers for DEBUG state (used by debug2)
-    Symbol debug_buffer[DEBUG_SYMBOLS_COUNT];
-    int debug_count = 0;
-
-    // Performance metrics variables
-    struct timespec start_time, end_time;
-    uint64_t total_analyze_time_ns = 0;
-    uint64_t symbols_analyzed_count = 0;
-
-    if (debug_mode == 2) {
-        printf("STATE: WAIT ACTIVITY. DEBUG 2 ENABLED: Waiting for SYNC pattern to collect %d symbols.\n", DEBUG_SYMBOLS_COUNT);
-    } else {
-        printf("STATE: WAIT ACTIVITY. Waiting for line activity...\n");
-    }
-
-    // The clean main loop
-    while (keep_running) {
-        // Calling get_next_symbol with the new filtering algorithm
-        if (get_next_symbol(&sym)) {
-            
-            // Start measuring the state machine processing time
-            clock_gettime(CLOCK_MONOTONIC, &start_time);
-            
-            switch (state) {
-                case STATE_WAIT_ACTIVITY:
-                    // Passed sync_buffer to capture the triggering symbol
-                    state = handle_state_wait_activity(sym, sync_buffer);
-                    break;
-
-                case STATE_SYNC_SEARCH:
-                    state = handle_state_sync_search(sym, sync_buffer, expected_sync, &prev_symbol, debug_mode);
-                    if (state == STATE_DEBUG) {
-                        debug_count = 0;
-                    } else if (state == STATE_ANALYZE) {
-                        bit_count = 0; 
-                    }
-                    break;
-                    
-                case STATE_ANALYZE:
-                    state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count);
-                    break;
-
-                case STATE_DEBUG:
-                    state = handle_state_debug(sym, debug_buffer, &debug_count);
-                    break;
-            }
-            
-            // Stop measuring the processing time
-            clock_gettime(CLOCK_MONOTONIC, &end_time);
-            
-            uint64_t ns_spent = (end_time.tv_sec - start_time.tv_sec) * 1000000000ULL + 
-                                (end_time.tv_nsec - start_time.tv_nsec);
-            total_analyze_time_ns += ns_spent;
-            symbols_analyzed_count++;
-            
-        }
-    }
-
-    // Stop hardware and unmap memory safely
-    smi_manager_cleanup();
-
-    // Print Performance Metrics
-    printf("\n--- Performance Metrics ---\n");
-    printf("Total symbols processed: %llu\n", (unsigned long long)symbols_analyzed_count);
-    if (symbols_analyzed_count > 0) {
-        double avg_analyze_time = (double)total_analyze_time_ns / symbols_analyzed_count;
-        printf("Average processing time per symbol: %.2f ns\n", avg_analyze_time);
-    }
-    printf("---------------------------\n");
-
-    // Output results based on the chosen mode
+void output_decoder_results(int debug_mode, Symbol* debug_buffer, int debug_count, uint8_t* bit_buffer, int bit_count) {
     if (debug_mode == 2) {
         if (debug_count > 0) {
             printf("\n--- Debug: Raw Symbols (%d) ---\n", debug_count);
@@ -522,6 +272,104 @@ int main(int argc, char *argv[]) {
         } else {
             printf("No data was decoded.\n");
         }
+    }
+}
+
+void run_main_decoder_loop(int debug_mode) {
+    DecoderState state = STATE_WAIT_ACTIVITY;
+    Symbol sym;
+    Symbol sync_buffer[8] = {{0, 0}}; 
+    
+    // Usually in USB (Full Speed): K J K J K J K K
+    Symbol expected_sync[8] = {
+        {1, 0}, {0, 1}, {1, 0}, {0, 1}, 
+        {1, 0}, {0, 1}, {1, 0}, {1, 0}
+    };
+
+    uint8_t bit_buffer[MAX_DECODED_BITS];
+    int bit_count = 0;
+    Symbol prev_symbol = {0, 0};
+
+    Symbol debug_buffer[DEBUG_SYMBOLS_COUNT];
+    int debug_count = 0;
+
+    struct timespec start_time, end_time;
+    uint64_t total_analyze_time_ns = 0;
+    uint64_t symbols_analyzed_count = 0;
+
+    if (debug_mode == 2) {
+        printf("STATE: WAIT ACTIVITY. DEBUG 2 ENABLED: Waiting for SYNC.\n");
+    } else {
+        printf("STATE: WAIT ACTIVITY. Waiting for line activity...\n");
+    }
+
+    while (keep_running) {
+        if (get_next_symbol(&sym)) {
+            clock_gettime(CLOCK_MONOTONIC, &start_time);
+            
+            switch (state) {
+                case STATE_WAIT_ACTIVITY:
+                    state = handle_state_wait_activity(sym, sync_buffer);
+                    break;
+
+                case STATE_SYNC_SEARCH:
+                    state = handle_state_sync_search(sym, sync_buffer, expected_sync, &prev_symbol, debug_mode);
+                    if (state == STATE_DEBUG) {
+                        debug_count = 0;
+                    } else if (state == STATE_ANALYZE) {
+                        bit_count = 0; 
+                    }
+                    break;
+                    
+                case STATE_ANALYZE:
+                    state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count, &keep_running);
+                    break;
+
+                case STATE_DEBUG:
+                    state = handle_state_debug(sym, debug_buffer, &debug_count, &keep_running);
+                    break;
+            }
+            
+            clock_gettime(CLOCK_MONOTONIC, &end_time);
+            
+            uint64_t ns_spent = (end_time.tv_sec - start_time.tv_sec) * 1000000000ULL + 
+                                (end_time.tv_nsec - start_time.tv_nsec);
+            total_analyze_time_ns += ns_spent;
+            symbols_analyzed_count++;
+        }
+    }
+
+    smi_manager_cleanup();
+    print_performance_metrics(total_analyze_time_ns, symbols_analyzed_count);
+    output_decoder_results(debug_mode, debug_buffer, debug_count, bit_buffer, bit_count);
+}
+
+/* =========================================================
+ * APPLICATION ENTRY POINT
+ * ========================================================= */
+
+int parse_arguments(int argc, char *argv[]) {
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--debug1") == 0) return 1;
+        if (strcmp(argv[i], "--debug2") == 0) return 2;
+    }
+    return -1; // Normal Mode
+}
+
+int main(int argc, char *argv[]) {
+    printf("--- SMI Logic Analyzer: Multi-Stage Packet Decoder ---\n");
+    signal(SIGINT, handle_sigint);
+    
+    int debug_mode = parse_arguments(argc, argv);
+
+    if (smi_manager_init(2000000) != 0) {
+        return -1;
+    }
+
+    if (debug_mode == 1) {
+        run_debug1_fast_path();
+    } else {
+        run_main_decoder_loop(debug_mode);
     }
 
     return 0;
