@@ -11,7 +11,8 @@
 #define CHUNK_SIZE 8
 #define MAX_DECODED_BITS 2048
 
-#define SAMPLES_PER_SYMBOL 6
+// Changed to a float to allow fractional sampling (e.g., exactly 5.5 samples per symbol on average)
+#define SAMPLES_PER_SYMBOL 5.5f
 
 // Debug configurations
 #define DEBUG_SYMBOLS_COUNT 128 
@@ -43,13 +44,15 @@ typedef enum {
 
 /**
  * Exclusively pulls chunks from SMI Manager and extracts valid symbols.
- * Uses synchronization logic: waits for SAMPLES_PER_SYMBOL consecutive identical samples.
+ * Uses fractional synchronization logic: waits for 'samples_per_symbol' (float) to prevent drift.
  */
-int get_next_symbol(Symbol* out_symbol) {
+int get_next_symbol(Symbol* out_symbol, float samples_per_symbol) {
     static uint32_t chunk[CHUNK_SIZE];
     static int chunk_idx = CHUNK_SIZE; 
     static uint32_t current_val = 0xFFFFFFFF;
-    static int consecutive_count = 0;
+    
+    // Using float to maintain fractional remainders over long stable sequences
+    static float consecutive_count = 0.0f; 
 
     while (keep_running) {
         if (chunk_idx >= CHUNK_SIZE) {
@@ -65,22 +68,27 @@ int get_next_symbol(Symbol* out_symbol) {
 
         if (current_val == 0xFFFFFFFF) {
             current_val = masked_val;
-            consecutive_count = 1;
+            consecutive_count = 1.0f;
             continue;
         }
 
         if (masked_val == current_val) {
-            consecutive_count++;
+            consecutive_count += 1.0f;
             
-            if (consecutive_count >= SAMPLES_PER_SYMBOL) {
+            if (consecutive_count >= samples_per_symbol) {
                 out_symbol->dplus = (masked_val & DPLUS_BIT_MASK) ? 1 : 0;
                 out_symbol->dminus = (masked_val & DMINUS_BIT_MASK) ? 1 : 0;
-                consecutive_count = 0; 
+                
+                // Subtract instead of setting to 0 to keep the fractional remainder!
+                // Example: if threshold is 5.5, count reaches 6.0, remainder is 0.5.
+                // This prevents drifting out of phase over long identical symbol runs.
+                consecutive_count -= samples_per_symbol; 
                 return 1;
             }
         } else {
+            // Signal edge detected, resynchronize starting at count 1.0
             current_val = masked_val;
-            consecutive_count = 1;
+            consecutive_count = 1.0f;
         }
     }
     return 0;
@@ -205,29 +213,31 @@ void run_debug1_fast_path() {
         Symbol debug_symbols[DEBUG_SYMBOLS_COUNT];
         int sym_count = 0;
         uint32_t current_val = 0xFFFFFFFF;
-        int consecutive_count = 0;
+        
+        float consecutive_count = 0.0f; // float for fractional precision
+        float samples_per_symbol = SAMPLES_PER_SYMBOL;
         
         for (int i = 0; i < collected; i++) {
             uint32_t masked_val = sample_buffer[i] & (DPLUS_BIT_MASK | DMINUS_BIT_MASK);
             
             if (current_val == 0xFFFFFFFF) {
                 current_val = masked_val;
-                consecutive_count = 1;
+                consecutive_count = 1.0f;
                 continue;
             }
             
             if (masked_val == current_val) {
-                consecutive_count++;
-                if (consecutive_count >= SAMPLES_PER_SYMBOL) {
+                consecutive_count += 1.0f;
+                if (consecutive_count >= samples_per_symbol) {
                     debug_symbols[sym_count].dplus = (masked_val & DPLUS_BIT_MASK) ? 1 : 0;
                     debug_symbols[sym_count].dminus = (masked_val & DMINUS_BIT_MASK) ? 1 : 0;
                     sym_count++;
-                    consecutive_count = 0; 
+                    consecutive_count -= samples_per_symbol; // keep fraction
                     if (sym_count >= DEBUG_SYMBOLS_COUNT) break;
                 }
             } else {
                 current_val = masked_val;
-                consecutive_count = 1;
+                consecutive_count = 1.0f;
             }
         }
         
@@ -247,12 +257,21 @@ void run_debug1_fast_path() {
 /**
  * Handles the WAIT_ACTIVITY state logic.
  * Looks for an unusual voltage state (D+ is HIGH) to start analysis.
+ * Injects the triggering symbol into the sync buffer so it's not missed.
  */
-DecoderState handle_state_wait_activity(Symbol sym) {
+DecoderState handle_state_wait_activity(Symbol sym, Symbol* sync_buffer) {
     // Check for unusual activity: D+ going high
     if (sym.dplus == 1) {
         printf("Unusual line activity detected (D+ HIGH)!\n");
         printf("Switching to SYNC SEARCH state...\n");
+        
+        // Push this first symbol into the shift register! 
+        // This prevents the first SYNC symbol from being consumed and lost.
+        for (int i = 0; i < 7; i++) {
+            sync_buffer[i] = sync_buffer[i+1];
+        }
+        sync_buffer[7] = sym;
+        
         return STATE_SYNC_SEARCH;
     }
     
@@ -411,14 +430,16 @@ int main(int argc, char *argv[]) {
 
     // The clean main loop
     while (keep_running) {
-        if (get_next_symbol(&sym)) {
+        // Passing the SAMPLES_PER_SYMBOL float to the symbol extraction logic
+        if (get_next_symbol(&sym, SAMPLES_PER_SYMBOL)) {
             
             // Start measuring the state machine processing time
             clock_gettime(CLOCK_MONOTONIC, &start_time);
             
             switch (state) {
                 case STATE_WAIT_ACTIVITY:
-                    state = handle_state_wait_activity(sym);
+                    // Passed sync_buffer to capture the triggering symbol
+                    state = handle_state_wait_activity(sym, sync_buffer);
                     break;
 
                 case STATE_SYNC_SEARCH:
