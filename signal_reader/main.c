@@ -18,7 +18,7 @@
 
 // Debug and Recording configurations
 #define DEBUG_SAMPLES_COUNT 1024 
-#define MAX_RECORDED_PACKETS 10000 // Maximum number of packets to hold in RAM before writing
+#define MAX_RECORDED_PACKETS 10000 // Maximum number of transactions to hold in RAM before writing
 
 // Assuming D+ is connected to GPIO9 (Bit 1). Change the shift if it's on a different pin.
 #define DPLUS_BIT_MASK (1 << 1) 
@@ -31,11 +31,13 @@ void handle_sigint(int sig) {
     keep_running = 0;
 }
 
-// Structure to hold a single packet's raw bits in RAM
+// Structure to hold a complete paired transaction (Token + Data) in RAM
 typedef struct {
-    uint8_t bits[MAX_DECODED_BITS];
-    int bit_count;
-} RecordedPacket;
+    uint8_t token_bits[MAX_DECODED_BITS];
+    int token_bit_count;
+    uint8_t data_bits[MAX_DECODED_BITS];
+    int data_bit_count;
+} RecordedTransaction;
 
 /* =========================================================
  * CORE HARDWARE SAMPLING & DIGITAL FILTERING
@@ -131,15 +133,6 @@ void export_and_plot_symbols(Symbol* buffer, int count) {
 
     printf("Plotting symbol graph...\n");
     system("python3 plot_waveform.py");
-}
-
-void fprint_decoded_bits(FILE* stream, const uint8_t* bits, int count) {
-    fprintf(stream, "Bits (%d): ", count);
-    for (int i = 0; i < count; i++) {
-        fprintf(stream, "%d", bits[i]);
-        if ((i + 1) % 8 == 0) fprintf(stream, " "); 
-    }
-    fprintf(stream, "\n");
 }
 
 void print_decoded_bits(const uint8_t* bits, int count) {
@@ -288,10 +281,13 @@ void output_decoder_results(int debug_mode, Symbol* debug_buffer, int debug_coun
     }
 }
 
-void flush_records_to_file(RecordedPacket* records, int count) {
+/**
+ * Formats and writes the paired Token and Data packets nicely into the text file.
+ */
+void flush_records_to_file(RecordedTransaction* records, int count) {
     if (count == 0) return;
     
-    printf("\nSaving %d recorded packets to 'recorded_packets.txt'...\n", count);
+    printf("\nSaving %d paired transactions to 'recorded_packets.txt'...\n", count);
     FILE *fp = fopen("recorded_packets.txt", "w");
     if (!fp) {
         printf("Error: Could not open recorded_packets.txt for writing.\n");
@@ -299,11 +295,36 @@ void flush_records_to_file(RecordedPacket* records, int count) {
     }
 
     for (int i = 0; i < count; i++) {
-        fprintf(fp, "=== Packet #%d ===\n", i + 1);
-        fprint_decoded_bits(fp, records[i].bits, records[i].bit_count);
+        fprintf(fp, "=== Transaction #%d ===\n", i + 1);
         
-        UsbPacket pkt_info = analyze_usb_packet(records[i].bits, records[i].bit_count);
-        fprint_usb_packet(fp, &pkt_info, 0);
+        // Print Token line (if exists)
+        if (records[i].token_bit_count > 0) {
+            UsbPacket token_info = analyze_usb_packet(records[i].token_bits, records[i].token_bit_count);
+            fprintf(fp, "[TOKEN] PID: %-5s | ADDR: %-3d | ENDP: %-2d | CRC5:  0x%02X (%s)\n",
+                    token_info.pid_name, token_info.addr, token_info.endp, 
+                    token_info.crc5_received, token_info.crc5_valid ? "VALID" : "INVALID");
+        }
+
+        // Print Data line (if exists)
+        if (records[i].data_bit_count > 0) {
+            UsbPacket data_info = analyze_usb_packet(records[i].data_bits, records[i].data_bit_count);
+            fprintf(fp, "[DATA]  PID: %-5s | CRC16: 0x%04X (%s) | PAYLOAD: ",
+                    data_info.pid_name, data_info.crc16_received, data_info.crc16_valid ? "VALID" : "INVALID");
+            
+            // Reconstruct payload bytes from bits for compact printing
+            for(int j = 0; j < data_info.data_bits_len; j += 8) {
+                int bits_to_read = (data_info.data_bits_len - j >= 8) ? 8 : (data_info.data_bits_len - j);
+                uint32_t byte_val = 0;
+                for (int k = 0; k < bits_to_read; k++) {
+                    if (data_info.data_bits[j + k]) {
+                        byte_val |= (1 << k);
+                    }
+                }
+                fprintf(fp, "%02X ", byte_val);
+            }
+            fprintf(fp, "\n");
+        }
+        
         fprintf(fp, "\n");
     }
 
@@ -330,17 +351,22 @@ void run_main_decoder_loop(int debug_mode, int record_mode) {
     Symbol debug_buffer[DEBUG_SYMBOLS_COUNT];
     int debug_count = 0;
     
-    // RAM buffer for recording multiple packets before file I/O
-    RecordedPacket* packet_record_buffer = NULL;
-    int recorded_packet_count = 0;
+    // RAM buffer for recording multiple paired transactions before file I/O
+    RecordedTransaction* transaction_record_buffer = NULL;
+    int recorded_transaction_count = 0;
+    
+    // Variables for tracking IN/OUT token pairs
+    uint8_t pending_token_bits[MAX_DECODED_BITS];
+    int pending_token_bit_count = 0;
+    int has_pending_token = 0;
 
     if (record_mode) {
-        packet_record_buffer = malloc(sizeof(RecordedPacket) * MAX_RECORDED_PACKETS);
-        if (!packet_record_buffer) {
-            printf("Warning: Could not allocate memory for packet recording! Recording disabled.\n");
+        transaction_record_buffer = malloc(sizeof(RecordedTransaction) * MAX_RECORDED_PACKETS);
+        if (!transaction_record_buffer) {
+            printf("Warning: Could not allocate memory for transaction recording! Recording disabled.\n");
             record_mode = 0;
         } else {
-            printf("RECORD MODE ENABLED: Capturing up to %d DATA packets in RAM.\n", MAX_RECORDED_PACKETS);
+            printf("RECORD MODE ENABLED: Capturing up to %d paired transactions in RAM.\n", MAX_RECORDED_PACKETS);
         }
     }
 
@@ -352,7 +378,6 @@ void run_main_decoder_loop(int debug_mode, int record_mode) {
         printf("STATE: WAIT ACTIVITY. DEBUG 2 ENABLED: Waiting for SYNC.\n");
     } else {
         printf("STATE: WAIT ACTIVITY. Waiting for line activity...\n");
-        // Tip for the user regarding speed
         if (!record_mode) {
             printf("(Tip: Printing to screen takes time. Use --record for high-speed continuous capture).\n");
         }
@@ -382,30 +407,57 @@ void run_main_decoder_loop(int debug_mode, int record_mode) {
                         DecoderState next_state = handle_state_analyze(sym, &prev_symbol, bit_buffer, &bit_count, &keep_running, &consecutive_ones);
                         
                         // Check if we finished reading the current packet
-                        if (next_state == STATE_WAIT_ACTIVITY) {
-                            if (bit_count > 0) {
-                                UsbPacket pkt_info = analyze_usb_packet(bit_buffer, bit_count);
-                                
-                                if (pkt_info.type == PKT_TYPE_DATA) {
-                                    // Print to screen if not recording (to save time) or if desired
-                                    print_decoded_bits(bit_buffer, bit_count);
-                                    print_usb_packet(&pkt_info, 0); 
-                                    
-                                    // Extremely fast RAM save operation
-                                    if (record_mode && recorded_packet_count < MAX_RECORDED_PACKETS) {
-                                        memcpy(packet_record_buffer[recorded_packet_count].bits, bit_buffer, bit_count);
-                                        packet_record_buffer[recorded_packet_count].bit_count = bit_count;
-                                        recorded_packet_count++;
+                        if (next_state == STATE_WAIT_ACTIVITY && bit_count > 0) {
+                            
+                            UsbPacket pkt_info = analyze_usb_packet(bit_buffer, bit_count);
+                            
+                            if (record_mode && transaction_record_buffer) {
+                                // Smart Transaction Recording Logic
+                                if (pkt_info.type == PKT_TYPE_TOKEN && (pkt_info.pid_val == 0x96 /*IN*/ || pkt_info.pid_val == 0x87 /*OUT*/)) {
+                                    // Store the token and wait to see if DATA follows
+                                    memcpy(pending_token_bits, bit_buffer, bit_count);
+                                    pending_token_bit_count = bit_count;
+                                    has_pending_token = 1;
+                                }
+                                else if (pkt_info.type == PKT_TYPE_DATA) {
+                                    // DATA packet arrived!
+                                    if (recorded_transaction_count < MAX_RECORDED_PACKETS) {
+                                        if (has_pending_token) {
+                                            // Pair found! Record both Token and Data
+                                            memcpy(transaction_record_buffer[recorded_transaction_count].token_bits, pending_token_bits, pending_token_bit_count);
+                                            transaction_record_buffer[recorded_transaction_count].token_bit_count = pending_token_bit_count;
+                                        } else {
+                                            // Orphan DATA packet (no preceding IN/OUT token)
+                                            transaction_record_buffer[recorded_transaction_count].token_bit_count = 0;
+                                        }
                                         
-                                        if (recorded_packet_count == MAX_RECORDED_PACKETS) {
+                                        // Save the DATA packet
+                                        memcpy(transaction_record_buffer[recorded_transaction_count].data_bits, bit_buffer, bit_count);
+                                        transaction_record_buffer[recorded_transaction_count].data_bit_count = bit_count;
+                                        
+                                        recorded_transaction_count++;
+                                        
+                                        if (recorded_transaction_count == MAX_RECORDED_PACKETS) {
                                             printf("Record buffer FULL! Stopping capture.\n");
                                             keep_running = 0;
                                         }
                                     }
+                                    has_pending_token = 0; // Consume the token
+                                }
+                                else {
+                                    // Any other packet (SOF, SETUP, Handshakes) cancels the pending IN/OUT token
+                                    has_pending_token = 0;
+                                }
+                            } else {
+                                // If not recording, just print DATA packets to the screen as before
+                                if (pkt_info.type == PKT_TYPE_DATA) {
+                                    print_decoded_bits(bit_buffer, bit_count);
+                                    print_usb_packet(&pkt_info, 0); 
                                 }
                             }
+                            
                             bit_count = 0;    
-                            if (recorded_packet_count < MAX_RECORDED_PACKETS) {
+                            if (recorded_transaction_count < MAX_RECORDED_PACKETS) {
                                 keep_running = 1; 
                             }
                         }
@@ -430,9 +482,9 @@ void run_main_decoder_loop(int debug_mode, int record_mode) {
     smi_manager_cleanup();
     
     // Defer the extremely slow file I/O until the hardware has stopped
-    if (record_mode && packet_record_buffer) {
-        flush_records_to_file(packet_record_buffer, recorded_packet_count);
-        free(packet_record_buffer);
+    if (record_mode && transaction_record_buffer) {
+        flush_records_to_file(transaction_record_buffer, recorded_transaction_count);
+        free(transaction_record_buffer);
     }
     
     print_performance_metrics(total_analyze_time_ns, symbols_analyzed_count);
