@@ -3,16 +3,17 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <signal.h>
-#include <time.h> // Required for high-resolution timing
 
 #include "smi_manager.h"
 
 #define CHUNK_SIZE 8
-#define POST_TRIGGER_SAMPLES 1024
+#define POST_TRIGGER_SYMBOLS 128
 
-// Assuming D+ is connected to GPIO0 (Bit 0). Change the shift if it's on a different pin.
+#define SAMPLES_PER_SYMBOL 6
+
+// Assuming D+ is connected to GPIO9 (Bit 1). Change the shift if it's on a different pin.
 #define DPLUS_BIT_MASK (1 << 1) 
-// Assuming D- is connected to GPIO8 (Bit 1)
+// Assuming D- is connected to GPIO8 (Bit 0)
 #define DMINUS_BIT_MASK (1 << 0)
 
 volatile int keep_running = 1;
@@ -21,8 +22,13 @@ void handle_sigint(int sig) {
     keep_running = 0;
 }
 
-void export_and_plot(uint32_t* buffer, int count) {
-    printf("Exporting %d post-trigger samples...\n", count);
+typedef struct {
+    uint8_t dplus;
+    uint8_t dminus;
+} Symbol;
+
+void export_and_plot(Symbol* buffer, int count) {
+    printf("Exporting %d post-trigger symbols...\n", count);
     FILE *fp = fopen("waveform.csv", "w");
     if (!fp) {
         printf("Error: Cannot create waveform.csv\n");
@@ -32,12 +38,7 @@ void export_and_plot(uint32_t* buffer, int count) {
     fprintf(fp, "Index,DPlus,DMinus\n");
     
     for (int i = 0; i < count; i++) {
-        int dplus = (buffer[i] & DPLUS_BIT_MASK) ? 1 : 0;
-        int dminus = (buffer[i] & DMINUS_BIT_MASK) ? 1 : 0;
-        
-        // Since the trigger is strictly before index 0 of this buffer, 
-        // we can just plot from index 0 sequentially.
-        fprintf(fp, "%d,%d,%d\n", i, dminus, dplus);
+        fprintf(fp, "%d,%d,%d\n", i, buffer[i].dplus, buffer[i].dminus);
     }
     fclose(fp);
 
@@ -45,8 +46,64 @@ void export_and_plot(uint32_t* buffer, int count) {
     system("python3 plot_waveform.py");
 }
 
+/**
+ * Exclusively pulls chunks from SMI Manager and extracts valid symbols.
+ * Uses synchronization logic: waits for SAMPLES_PER_SYMBOL consecutive identical samples.
+ * If a change occurs before reaching the threshold, the counter resets and ignores previous samples.
+ */
+int get_next_symbol(Symbol* out_symbol) {
+    static uint32_t chunk[CHUNK_SIZE];
+    static int chunk_idx = CHUNK_SIZE; // Initially empty to force a hardware read on first call
+    static uint32_t current_val = 0xFFFFFFFF;
+    static int consecutive_count = 0;
+
+    while (keep_running) {
+        // Fetch a new chunk if we have processed all elements in the current chunk
+        if (chunk_idx >= CHUNK_SIZE) {
+            while (keep_running && !smi_manager_read_chunk(chunk)) {
+                usleep(1); // Wait for hardware to provide data
+            }
+            if (!keep_running) return 0;
+            chunk_idx = 0;
+        }
+
+        uint32_t val = chunk[chunk_idx++];
+        
+        // Mask to focus only on D+ and D- bits
+        uint32_t masked_val = val & (DPLUS_BIT_MASK | DMINUS_BIT_MASK);
+
+        // Initialize state on the very first valid sample
+        if (current_val == 0xFFFFFFFF) {
+            current_val = masked_val;
+            consecutive_count = 1;
+            continue;
+        }
+
+        if (masked_val == current_val) {
+            consecutive_count++;
+            
+            // Passed enough samples to be considered a stable symbol
+            if (consecutive_count >= SAMPLES_PER_SYMBOL) {
+                out_symbol->dplus = (masked_val & DPLUS_BIT_MASK) ? 1 : 0;
+                out_symbol->dminus = (masked_val & DMINUS_BIT_MASK) ? 1 : 0;
+                
+                // Reset counter to correctly detect the next symbol 
+                // (whether it's an identical repeating symbol or a new one)
+                consecutive_count = 0; 
+                return 1;
+            }
+        } else {
+            // Signal changed before a full symbol period was reached.
+            // Reset synchronization to align with the new edge and ignore previous unstable samples.
+            current_val = masked_val;
+            consecutive_count = 1;
+        }
+    }
+    return 0;
+}
+
 int main() {
-    printf("--- SMI Logic Analyzer: Trigger & Collect ---\n");
+    printf("--- SMI Logic Analyzer: Symbol Synchronizer & Decoder ---\n");
     signal(SIGINT, handle_sigint);
     
     // Initialize the SMI hardware (e.g., 2 MSPS)
@@ -54,96 +111,50 @@ int main() {
         return -1;
     }
 
-    uint32_t chunk[CHUNK_SIZE];
-    uint32_t post_trigger_buffer[POST_TRIGGER_SAMPLES];
+    Symbol post_trigger_buffer[POST_TRIGGER_SYMBOLS];
     
     int collected = 0;
     int triggered = 0;
-    
-    uint32_t prev_sample = 0;
-    int has_history = 0;
+    Symbol sym;
 
-    // Variables for performance metrics
-    struct timespec start_scan, end_scan;
-    uint64_t total_scan_time_ns = 0;
-    uint64_t total_samples_analyzed = 0;
-
-    printf("Waiting for RISING EDGE on D+...\n");
+    printf("Waiting for RISING EDGE on D+ (Symbol Level)...\n");
 
     while (keep_running) {
-        // Attempt to pull a chunk of 8 samples from the SMI manager
-        if (smi_manager_read_chunk(chunk)) {
+        // get_next_symbol is now the EXCLUSIVE consumer of smi_manager_read_chunk
+        if (get_next_symbol(&sym)) {
             
-            // Start the timer for this chunk analysis
-            clock_gettime(CLOCK_MONOTONIC, &start_scan);
-
             if (!triggered) {
-                // STATE 1: Searching for the trigger
-                for (int i = 0; i < CHUNK_SIZE; i++) {
-                    uint32_t val = chunk[i];
-                    
-                    if (has_history) {
-                        int prev_dplus = prev_sample & DPLUS_BIT_MASK;
-                        int curr_dplus = val & DPLUS_BIT_MASK;
-                        
-                        // Detect Rising Edge: Previous was LOW, Current is HIGH
-                        if (!prev_dplus && curr_dplus) {
-                            triggered = 1;
-                            printf("Triggered! Collecting next %d samples...\n", POST_TRIGGER_SAMPLES);
-                            
-                            // Start collecting samples immediately after the trigger point
-                            // from the remaining elements in this current chunk
-                            for (int j = i + 1; j < CHUNK_SIZE && collected < POST_TRIGGER_SAMPLES; j++) {
-                                post_trigger_buffer[collected++] = chunk[j];
-                            }
-                            break; 
-                        }
-                    }
-                    prev_sample = val;
-                    has_history = 1;
+                // STATE 1: Searching for the trigger (D+ goes HIGH)
+                if (sym.dplus == 1) {
+                    triggered = 1;
+                    printf("Triggered! Collecting next %d symbols...\n", POST_TRIGGER_SYMBOLS);
+                    post_trigger_buffer[collected++] = sym;
                 }
             } else {
-                // STATE 2: Trigger occurred, copy the entire chunk to our buffer
-                for (int i = 0; i < CHUNK_SIZE && collected < POST_TRIGGER_SAMPLES; i++) {
-                    post_trigger_buffer[collected++] = chunk[i];
+                // STATE 2: Trigger occurred, collect decoded symbols sequentially
+                post_trigger_buffer[collected++] = sym;
+                
+                // Stop the main loop if we have collected exactly what we need
+                if (collected >= POST_TRIGGER_SYMBOLS) {
+                    break; 
                 }
             }
-
-            // Stop the timer after the chunk is fully analyzed
-            clock_gettime(CLOCK_MONOTONIC, &end_scan);
-            
-            // Accumulate scan time
-            uint64_t ns_spent = (end_scan.tv_sec - start_scan.tv_sec) * 1000000000ULL + 
-                                (end_scan.tv_nsec - start_scan.tv_nsec);
-            total_scan_time_ns += ns_spent;
-            total_samples_analyzed += CHUNK_SIZE;
-
-            // Stop the main loop if we have collected exactly what we need
-            if (collected >= POST_TRIGGER_SAMPLES) {
-                break; 
-            }
-
-        } else {
-            // No chunk ready yet. Small sleep to prevent 100% CPU usage.
-            usleep(1);
         }
     }
 
-    // Stop hardware and unmap memory
+    // Stop hardware and unmap memory safely
     smi_manager_cleanup();
 
-    // Print Performance Metrics
-    printf("\n--- Performance Metrics ---\n");
-    if (total_samples_analyzed > 0) {
-        double avg_scan_time = (double)total_scan_time_ns / total_samples_analyzed;
-        printf("Average time to analyze a single sample: %.2f ns\n", avg_scan_time);
-    }
-    printf("Total samples analyzed: %llu\n", (unsigned long long)total_samples_analyzed);
-    printf("---------------------------\n\n");
-
-    // Plot if we successfully collected the post-trigger data
+    // Plot and print if we successfully collected the post-trigger data
     if (triggered && collected > 0) {
         export_and_plot(post_trigger_buffer, collected);
+        
+        printf("\n--- Decoded Symbols ---\n");
+        for (int i = 0; i < collected; i++) {
+            printf("Symbol %3d: D+ = %d, D- = %d\n", i, post_trigger_buffer[i].dplus, post_trigger_buffer[i].dminus);
+        }
+        printf("--------------------------\n");
+        
     } else {
         printf("Aborted before trigger was found or collection was complete.\n");
     }
