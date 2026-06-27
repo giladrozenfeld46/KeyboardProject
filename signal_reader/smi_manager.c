@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <fcntl.h>
-#include <sys/mmap.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <string.h>
 
