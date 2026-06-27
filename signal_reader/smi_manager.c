@@ -152,7 +152,7 @@ int smi_manager_init(uint32_t sample_rate) {
     g_current_read_index = 0;
 
     // 5. Start SMI and DMA RX
-    smi_start_capture(&smi_hw, 0, sample_rate); // 0 for continuous capture
+    smi_start_capture(&smi_hw, 0xFFFFFFFF, sample_rate); 
     start_dma_channel((volatile uint32_t*)dma_chan5, cb_buf.bus_addr);
 
     printf("SMI and DMA RX initialized and running.\n");
