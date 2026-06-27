@@ -8,6 +8,7 @@
 
 #include "smi_manager.h"
 #include "dma_control.h"
+#include "dma_mem.h"
 #include "smi_hal.h"
 
 // Configuration for multiple separate buffers
@@ -139,7 +140,7 @@ int smi_manager_init(uint32_t sample_rate) {
     g_current_read_index = 0;
 
     // 5. Start SMI and DMA RX
-    smi_start_capture(&smi_hw);
+    smi_start_capture(&smi_hw, 0, sample_rate); // 0 for continuous capture
     start_dma_channel((volatile uint32_t*)dma_chan5, cb_buf.bus_addr);
 
     printf("SMI and DMA RX initialized and running.\n");
@@ -200,7 +201,7 @@ int smi_manager_write_data(uint32_t *data, int length) {
 
     // 2. Set the dynamic length in the middle Control Block (CB 1)
     struct DmaControlBlock* tx_cbs = (struct DmaControlBlock*)tx_cb_buf.virtual_addr;
-    tx_cbs[1].transfer_length = length * sizeof(uint32_t);
+    tx_cbs[1].txfr_len = length * sizeof(uint32_t);
 
     // 3. Trigger DMA Channel 4!
     // This stops RX implicitly (because SMI switches direction), pumps the data, 
