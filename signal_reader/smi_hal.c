@@ -15,7 +15,7 @@
 #define SMI_A_REG            0x08 
 #define SMI_D_REG            0x0C 
 #define SMI_DSR0_REG         0x10  
-#define SMI_DSW0_REG         0x14  
+#define SMI_DSW0_REG         0x14
 #define SMI_DMC_REG          0x30  
 
 // --- Clock Manager (CM) & GPIO Register offsets ---
@@ -127,10 +127,17 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     hw->smi[SMI_CS_REG / 4] = SMI_CS_ENABLE | SMI_CS_CLEAR;
     usleep(10);
     
-    hw->smi[SMI_DSR0_REG / 4] = (setup << SMI_DSR_SETUP_SHIFT) | 
-                                (strobe << SMI_DSR_STROBE_SHIFT) | 
-                                (hold << SMI_DSR_HOLD_SHIFT) | 
-                                (pace << SMI_DSR_PACE_SHIFT); 
+    // --- READ TIMING ---
+    uint32_t timing_value = (setup << SMI_DSR_SETUP_SHIFT) | 
+                            (strobe << SMI_DSR_STROBE_SHIFT) | 
+                            (hold << SMI_DSR_HOLD_SHIFT) | 
+                            (pace << SMI_DSR_PACE_SHIFT);
+                            
+    hw->smi[SMI_DSR0_REG / 4] = timing_value; 
+    
+    // --- WRITE TIMING (NEW) ---
+    // Copy the exact same timing to the DSW0 register so Tx is at the same speed as Rx
+    hw->smi[SMI_DSW0_REG / 4] = timing_value;
                                 
     hw->smi[SMI_L_REG / 4] = num_samples; 
     hw->smi[SMI_A_REG / 4] = 0;

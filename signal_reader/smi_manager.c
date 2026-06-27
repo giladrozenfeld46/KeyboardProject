@@ -1,142 +1,187 @@
 #include <stdio.h>
-#include <stdint.h>
 #include <stdlib.h>
+#include <stdint.h>
 #include <fcntl.h>
-#include <sys/mman.h>
+#include <sys/mmap.h>
 #include <unistd.h>
-#include <string.h> 
+#include <string.h>
 
-#include "dma_mem.h"
+#include "smi_manager.h"
 #include "dma_control.h"
 #include "smi_hal.h"
-#include "smi_manager.h"
 
-#define BUFFER_SAMPLES       1024 
-#define BUFFER_BYTES         (BUFFER_SAMPLES * 4) 
-#define NUM_RX_BUFFERS       4
+// Configuration for multiple separate buffers
+#define BUFFER_SAMPLES       1024
+#define BUFFER_BYTES         (BUFFER_SAMPLES * 4)
+#define NUM_BUFFERS          16
+#define NUM_BUFFERS_RX       15 // Reserve the 16th buffer strictly for TX
+#define TX_BUFFER_INDEX      15
+
+// Optimization: Number of samples to fetch in a single burst (must be a divisor of BUFFER_SAMPLES)
 #define CHUNK_SIZE           8
 
-// DMA Configuration 
+// DMA Configuration: SMI DREQ, Wait for DREQ, Increment Dest, Interrupt Enable
 #define DMA_TI_SMI_CIRCULAR  ((4 << 16) | (1 << 10) | (1 << 4) | (1 << 2))
-#define DMA_TI_SMI_TX        ((5 << 16) | (1 << 8) | (0 << 4))
-#define DMA_TI_MEM_TO_MEM    ((0 << 16) | (1 << 8) | (0 << 4)) // Unpaced memory copy
 
-// Physical & Bus Addresses (Assuming Pi 4 based on 0xFE base)
-#define SMI_PHYSICAL_BASE    0xFE600000 
-#define SMI_D_BUS_ADDR       0x7E60000C
-#define DMA_CHAN_RX_CS_BUS   0x7E007500 // Bus address for Channel 5 CS register
+// DMA Configuration for TX (Wait for DEST DREQ, Increment Source)
+#define DMA_TI_SMI_TX        ((4 << 16) | (1 << 6) | (1 << 8))
 
-// SMI CS Register Bits
-#define SMI_CS_ENABLE        (1 << 0)
-#define SMI_CS_START         (1 << 1)
-#define SMI_CS_DONE          (1 << 2)
-#define SMI_CS_WRITE         (1 << 3)
+// DMA Configuration for Register Setup (No DREQ, just copy 1 word instantly)
+#define DMA_TI_NO_DREQ       (1 << 3) // WAIT_RESP
+
+// Physical bus addresses for SMI registers (for Pi 4)
+#define SMI_CS_REG           0x7E600000
+#define SMI_DATA_REG         0x7E60000C
 
 // --- GLOBAL MODULE STATE ---
-static DmaBuffer rx_cb_buf;
-static DmaBuffer tx_cb_buf; 
-static DmaBuffer rx_sample_bufs[NUM_RX_BUFFERS]; 
-static DmaBuffer tx_sample_buf;
-static DmaBuffer dma_wakeup_buf; // Holds the hardware resume command
-
+static DmaBuffer cb_buf;
+static DmaBuffer tx_cb_buf; // Control blocks for the Tx sequence
+static DmaBuffer sample_bufs[NUM_BUFFERS];
 static SmiHardware smi_hw;
 static volatile uint32_t *dma_base = NULL;
-static volatile uint32_t *dma_chan_rx = NULL; // Channel 5
-static volatile uint32_t *dma_chan_tx = NULL; // Channel 6
-static int mem_fd = -1; // FIXED: Global mem_fd declaration added
+static volatile uint32_t *dma_chan5 = NULL; // RX Channel
+static volatile uint32_t *dma_chan4 = NULL; // TX Channel
+static int mem_fd = -1;
 
-// Direct SMI Registers mapping for Inlining
-static volatile uint32_t *smi_regs = NULL; 
+// --- GLOBAL READ POINTERS ---
+static int g_current_read_buffer = 0;
+static int g_current_read_index = 0;
 
-static uint32_t g_target_rate_hz = 0;
+int smi_manager_init(uint32_t sample_rate) {
+    printf("Initializing SMI Manager...\n");
 
-// Read Pointers
-uint32_t g_current_read_buffer = 0;
-uint32_t g_current_read_index = 0;
-
-int smi_manager_init(uint32_t target_rate_hz) {
-    printf("Initializing Accelerated SMI Manager...\n");
-    g_target_rate_hz = target_rate_hz;
-    
     mem_fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (mem_fd < 0) return -1;
-
-    // Allocate Buffers
-    for (int i = 0; i < NUM_RX_BUFFERS; i++) {
-        allocate_dma_buffer(&rx_sample_bufs[i], BUFFER_BYTES);
-        memset((void*)rx_sample_bufs[i].virtual_addr, 0xFF, BUFFER_BYTES);
-    }
-    allocate_dma_buffer(&tx_sample_buf, BUFFER_BYTES);
-    
-    // Allocate Wakeup Command Buffer for DMA hardware chaining
-    allocate_dma_buffer(&dma_wakeup_buf, 4);
-    *((volatile uint32_t*)dma_wakeup_buf.virtual_addr) = 1; // 1 = DMA ACTIVE bit
-
-    // Allocate Control Blocks (TX needs 2 blocks now)
-    allocate_dma_buffer(&rx_cb_buf, sizeof(struct DmaControlBlock) * NUM_RX_BUFFERS);
-    allocate_dma_buffer(&tx_cb_buf, sizeof(struct DmaControlBlock) * 2);
-    
-    // Setup Circular Chain for RX
-    struct DmaControlBlock* rx_cbs = (struct DmaControlBlock*)rx_cb_buf.virtual_addr;
-    for (int i = 0; i < NUM_RX_BUFFERS; i++) {
-        setup_dma_control_block(&rx_cbs[i], DMA_TI_SMI_CIRCULAR, SMI_D_BUS_ADDR, 
-                                rx_sample_bufs[i].bus_addr, BUFFER_BYTES);
-        rx_cbs[i].nextconbk = (i == NUM_RX_BUFFERS - 1) ? rx_cb_buf.bus_addr : 
-                              rx_cb_buf.bus_addr + ((i + 1) * sizeof(struct DmaControlBlock));
+    if (mem_fd < 0) {
+        perror("Failed to open /dev/mem");
+        return -1;
     }
 
-    // Setup TX Chain
+    // 1. Allocate sample buffers (15 for RX, 1 for TX)
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        if (allocate_dma_buffer(&sample_bufs[i], BUFFER_BYTES) != 0) {
+            printf("Failed to allocate sample buffer %d.\n", i);
+            return -1;
+        }
+    }
+
+    // 2. Allocate memory for RX Control Blocks
+    if (allocate_dma_buffer(&cb_buf, sizeof(struct DmaControlBlock) * NUM_BUFFERS_RX) != 0) {
+        printf("Failed to allocate RX control blocks.\n");
+        return -1;
+    }
+
+    // 2.5 Allocate memory for TX Control Blocks (3 CBs + 2 configuration words = 104 bytes -> padding to 128)
+    if (allocate_dma_buffer(&tx_cb_buf, sizeof(struct DmaControlBlock) * 3 + 8) != 0) {
+        printf("Failed to allocate TX control blocks.\n");
+        return -1;
+    }
+
+    struct DmaControlBlock* cbs = (struct DmaControlBlock*)cb_buf.virtual_addr;
+
+    // 3. Chain the RX blocks together circularly (Using 15 buffers)
+    for (int i = 0; i < NUM_BUFFERS_RX; i++) {
+        setup_dma_control_block(&cbs[i], DMA_TI_SMI_CIRCULAR, SMI_DATA_REG, 
+                                sample_bufs[i].bus_addr, BUFFER_BYTES);
+        
+        if (i == NUM_BUFFERS_RX - 1) {
+            cbs[i].nextconbk = cb_buf.bus_addr; // Loop back to start
+        } else {
+            cbs[i].nextconbk = cb_buf.bus_addr + ((i + 1) * sizeof(struct DmaControlBlock));
+        }
+    }
+
+    // 3.5 Set up TX Control Blocks (Setup -> Send Data -> Restore)
     struct DmaControlBlock* tx_cbs = (struct DmaControlBlock*)tx_cb_buf.virtual_addr;
-    
-    // TX CB 0: Payload Transfer to SMI
-    setup_dma_control_block(&tx_cbs[0], DMA_TI_SMI_TX, tx_sample_buf.bus_addr, SMI_D_BUS_ADDR, BUFFER_BYTES);
-    tx_cbs[0].nextconbk = tx_cb_buf.bus_addr + sizeof(struct DmaControlBlock); // Chain to CB 1
-    
-    // TX CB 1: Hardware-triggered Wakeup of RX DMA
-    // Writes the value '1' directly into the RX DMA Channel CS register
-    setup_dma_control_block(&tx_cbs[1], DMA_TI_MEM_TO_MEM, dma_wakeup_buf.bus_addr, DMA_CHAN_RX_CS_BUS, 4);
-    tx_cbs[1].nextconbk = 0; // End of chain
+    // Place config words right after the 3 CBs to keep everything in the same DMA memory block
+    uint32_t* configs = (uint32_t*)((uint8_t*)tx_cbs + (3 * sizeof(struct DmaControlBlock))); 
 
-    // Map Hardware Registers
-    dma_base = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, 0xFE007000);
-    smi_regs = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, SMI_PHYSICAL_BASE);
-    
-    dma_chan_rx = dma_base + (0x500 / 4); 
-    dma_chan_tx = dma_base + (0x600 / 4); 
-    
-    // Reset DMA Channels
-    dma_chan_rx[0] = (1 << 31); 
-    dma_chan_tx[0] = (1 << 31);
-    usleep(1000); 
-    dma_chan_rx[0] = 0;
-    dma_chan_tx[0] = 0;
+    // WRITE Mode: Enable(1) + Start(4) + Clear(8) + Write(16) = 0x1D
+    configs[0] = 0x1D; 
+    // READ Mode: Enable(1) + Start(4) + Clear(8) = 0x0D
+    configs[1] = 0x0D; 
 
-    // Start Operations
+    uint32_t configs_bus_addr = tx_cb_buf.bus_addr + (3 * sizeof(struct DmaControlBlock));
+
+    // CB 0: Write config to SMI CS (Switch to TX Mode)
+    setup_dma_control_block(&tx_cbs[0], DMA_TI_NO_DREQ, configs_bus_addr, SMI_CS_REG, 4);
+    tx_cbs[0].nextconbk = tx_cb_buf.bus_addr + sizeof(struct DmaControlBlock);
+
+    // CB 1: Send Data to SMI FIFO (Length is dynamic, will be set during write call)
+    setup_dma_control_block(&tx_cbs[1], DMA_TI_SMI_TX, sample_bufs[TX_BUFFER_INDEX].bus_addr, SMI_DATA_REG, 0);
+    tx_cbs[1].nextconbk = tx_cb_buf.bus_addr + 2 * sizeof(struct DmaControlBlock);
+
+    // CB 2: Restore config to SMI CS (Switch back to RX Mode instantly)
+    setup_dma_control_block(&tx_cbs[2], DMA_TI_NO_DREQ, configs_bus_addr + 4, SMI_CS_REG, 4);
+    tx_cbs[2].nextconbk = 0; // End of chain
+
+    // Initialize hardware
     smi_init(&smi_hw, mem_fd);
-    start_dma_channel((volatile uint32_t*)dma_chan_rx, rx_cb_buf.bus_addr);
-    smi_start_capture(&smi_hw, 0xFFFFFFFF, target_rate_hz); 
 
+    // Map DMA channels 4 and 5
+    dma_base = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, 0xFE007000);
+    if (dma_base == MAP_FAILED) {
+        perror("Failed to mmap DMA");
+        return -1;
+    }
+
+    dma_chan5 = dma_base + (0x500 / 4); // RX Channel base address
+    dma_chan4 = dma_base + (0x400 / 4); // TX Channel base address
+
+    // 4. Hardware Reset for DMA 
+    dma_chan5[0] = (1 << 31); 
+    dma_chan4[0] = (1 << 31);
+    usleep(1000); 
+    dma_chan5[0] = 0;
+    dma_chan4[0] = 0;
+
+    // Reset read pointers
+    g_current_read_buffer = 0;
+    g_current_read_index = 0;
+
+    // 5. Start SMI and DMA RX
+    smi_start_capture(&smi_hw);
+    start_dma_channel((volatile uint32_t*)dma_chan5, cb_buf.bus_addr);
+
+    printf("SMI and DMA RX initialized and running.\n");
     return 0;
 }
 
 int smi_manager_read_chunk(uint32_t *out_samples) {
-    if (!out_samples) return 0;
+    uint32_t current_cb_bus_addr = dma_chan5[1]; // CONBLK_AD
+    int active_buffer_index = -1;
 
-    volatile uint32_t* current_buffer_ptr = (volatile uint32_t*)rx_sample_bufs[g_current_read_buffer].virtual_addr;
+    for (int i = 0; i < NUM_BUFFERS_RX; i++) {
+        uint32_t expected_addr = cb_buf.bus_addr + (i * sizeof(struct DmaControlBlock));
+        if (current_cb_bus_addr == expected_addr) {
+            active_buffer_index = i;
+            break;
+        }
+    }
 
-    if (current_buffer_ptr[g_current_read_index + (CHUNK_SIZE - 1)] == 0xFFFFFFFF) {
+    if (active_buffer_index == -1) {
         return 0; 
     }
 
-    memcpy(out_samples, (void*)&current_buffer_ptr[g_current_read_index], CHUNK_SIZE * sizeof(uint32_t));
-    memset((void*)&current_buffer_ptr[g_current_read_index], 0xFF, CHUNK_SIZE * sizeof(uint32_t));
-    
+    uint32_t remaining_bytes = dma_chan5[3]; // TX_LEN
+    uint32_t written_bytes = BUFFER_BYTES - remaining_bytes;
+    uint32_t active_index_samples = written_bytes / 4;
+
+    if (g_current_read_buffer == active_buffer_index) {
+        if (g_current_read_index + CHUNK_SIZE > active_index_samples) {
+            return 0; 
+        }
+    }
+
+    uint32_t* buffer_data = (uint32_t*)sample_bufs[g_current_read_buffer].virtual_addr;
+    memcpy(out_samples, &buffer_data[g_current_read_index], CHUNK_SIZE * sizeof(uint32_t));
     g_current_read_index += CHUNK_SIZE;
-    
+
+    // Wrap around logic for the buffers
     if (g_current_read_index >= BUFFER_SAMPLES) {
         g_current_read_index = 0;
         g_current_read_buffer++;
-        if (g_current_read_buffer >= NUM_RX_BUFFERS) {
+        
+        if (g_current_read_buffer >= NUM_BUFFERS_RX) {
             g_current_read_buffer = 0;
         }
     }
@@ -144,76 +189,59 @@ int smi_manager_read_chunk(uint32_t *out_samples) {
     return 1;
 }
 
-void smi_manager_write_sequence(const uint8_t* gpio8_seq, const uint8_t* gpio9_seq, size_t length) {
-    if (length > BUFFER_SAMPLES) length = BUFFER_SAMPLES;
-
-    // 1. PRE-PROCESS payload
-    volatile uint32_t* tx_buf = (volatile uint32_t*)tx_sample_buf.virtual_addr;
-    for (size_t i = 0; i < length; i++) {
-        uint32_t word = 0;
-        if (gpio8_seq[i]) word |= (1 << 0);
-        if (gpio9_seq[i]) word |= (1 << 1);
-        tx_buf[i] = word;
+int smi_manager_write_data(uint32_t *data, int length) {
+    if (!data || length <= 0 || length > BUFFER_SAMPLES) {
+    printf("Error: Invalid TX data length.\n");
+    return -1;
     }
 
-    // Update payload length dynamically in the TX Control Block
+    // 1. Copy the data array to our dedicated TX DMA buffer
+    memcpy((void*)sample_bufs[TX_BUFFER_INDEX].virtual_addr, data, length * sizeof(uint32_t));
+
+    // 2. Set the dynamic length in the middle Control Block (CB 1)
     struct DmaControlBlock* tx_cbs = (struct DmaControlBlock*)tx_cb_buf.virtual_addr;
-    tx_cbs[0].txfr_len = length * sizeof(uint32_t); // FIXED: Using txfr_len instead of length
+    tx_cbs[1].transfer_length = length * sizeof(uint32_t);
 
-    // 2. INLINE PAUSE RX DMA
-    dma_chan_rx[0] &= ~1; 
-    while (dma_chan_rx[0] & 1); // Wait for physical pause
-    
-    smi_regs[0] = 0; // Disable SMI to clear state
+    // 3. Trigger DMA Channel 4!
+    // This stops RX implicitly (because SMI switches direction), pumps the data, 
+    // and then sets SMI back to RX, allowing DMA Channel 5 to resume automatically.
+    start_dma_channel((volatile uint32_t*)dma_chan4, tx_cb_buf.bus_addr);
 
-    // 3. INLINE CONFIGURE SMI TX
-    smi_regs[1] = length; // Set transfer length in SMI L register
-    smi_regs[0] = SMI_CS_ENABLE | SMI_CS_WRITE | SMI_CS_START; 
+    // 4. Block until transmission is complete
+    while (dma_chan4[0] & 1) { // ACTIVE bit
+        usleep(1);
+    }
 
-    // 4. FIRE TX DMA (This handles data + hardware RX wake up automatically)
-    dma_chan_tx[1] = tx_cb_buf.bus_addr; // Point to CB 0
-    dma_chan_tx[0] = 1; // Start TX DMA
-
-    // 5. INLINE POLL SMI DONE
-    // The DMA finishes quickly, but we MUST wait for the SMI FIFO to push out the last bits
-    while (!(smi_regs[0] & SMI_CS_DONE));
-
-    // 6. INLINE SWITCH TO RX
-    // At this exact moment, TX DMA has already executed CB 1 and set RX DMA ACTIVE bit.
-    // RX DMA is awake, but waiting for DREQ. We now provide the DREQ.
-    smi_regs[0] = 0; 
-    smi_regs[1] = 0xFFFFFFFF; // Infinite read
-    smi_regs[0] = SMI_CS_ENABLE | SMI_CS_START; // Read mode
+    return 0;
 }
 
 void smi_manager_cleanup() {
     printf("Stopping SMI and DMA hardware...\n");
-    
-    // FIXED: Updated to correctly reference the new channel pointers
-    if (dma_chan_rx) dma_chan_rx[0] = (1 << 31);
-    if (dma_chan_tx) dma_chan_tx[0] = (1 << 31);
-    
+
+    if (dma_chan5) {
+        // HARD RESET: Instantly freeze the DMA channels
+        dma_chan5[0] = (1 << 31);
+        dma_chan4[0] = (1 << 31);
+    }
+
     smi_stop_capture(&smi_hw);
-    smi_cleanup(&smi_hw);
-    
+
     if (dma_base && dma_base != MAP_FAILED) {
         munmap((void*)dma_base, 4096);
+        dma_base = NULL;
     }
-    
-    // FIXED: Cleanup uses the globally declared mem_fd
+
+    // Free all scattered buffers
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        free_dma_buffer(&sample_bufs[i]);
+    }
+    free_dma_buffer(&cb_buf);
+    free_dma_buffer(&tx_cb_buf);
+
     if (mem_fd >= 0) {
         close(mem_fd);
+        mem_fd = -1;
     }
-    
-    // FIXED: Memory freeing logic updated for the separated RX and TX buffers
-    for (int i = 0; i < NUM_RX_BUFFERS; i++) {
-        free_dma_buffer(&rx_sample_bufs[i]);
-    }
-    free_dma_buffer(&tx_sample_buf);
-    free_dma_buffer(&dma_wakeup_buf);
-    
-    free_dma_buffer(&rx_cb_buf);
-    free_dma_buffer(&tx_cb_buf);
-    
+
     printf("SMI Manager cleaned up successfully.\n");
 }

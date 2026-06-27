@@ -21,14 +21,14 @@ int smi_manager_init(uint32_t target_rate_hz);
 int smi_manager_read_chunk(uint32_t *out_samples);
 
 /**
- * Writes a sequence of GPIO8 and GPIO9 values to the SMI hardware for transmission.
- * The sequences are expected to be arrays of 0s and 1s, representing LOW and HIGH states.
- * The length of the sequences should not exceed BUFFER_SAMPLES (1024).
- * @param gpio8_seq Pointer to an array of uint8_t values for GPIO8.
- * @param gpio9_seq Pointer to an array of uint8_t values for GPIO9.
- * @param length The number of samples in each sequence (must be <= BUFFER_SAMPLES).
- */
-void smi_manager_write_sequence(const uint8_t* gpio8_seq, const uint8_t* gpio9_seq, size_t length);
+* Transmits a sequence of bits to GPIO pins via the SMI and DMA.
+* Automatically switches the hardware from Read to Write, sends the data,
+* and seamlessly switches back to Read mode using a secondary DMA channel.
+* @param data Pointer to the array of 32-bit values to transmit.
+* @param length Number of 32-bit samples to send.
+* @return 0 on success, -1 on failure.
+*/
+int smi_manager_write_data(uint32_t *data, int length);
 
 /**
  * Stops the hardware, unmaps memory, and frees all allocated DMA buffers.
