@@ -142,12 +142,12 @@ void smi_start_capture(SmiHardware* hw, uint32_t num_samples, uint32_t target_hz
     hw->smi[SMI_L_REG / 4] = num_samples; 
     hw->smi[SMI_A_REG / 4] = 0;
 
-    // 5. Set GPIO to ALT1 for SMI
-    hw->gpio[GPFSEL0] |= ((GPIO_FUNC_ALT1 << 24) | (GPIO_FUNC_ALT1 << 27));
-
-    // 6. Start Capture and Enable DMA Request Generation
+    // 5. Start Capture and Enable DMA Request Generation
     hw->smi[SMI_DMC_REG / 4] = SMI_DMC_DMAEN | SMI_DMC_REQR_1 | SMI_DMC_PANICR_1;
     hw->smi[SMI_CS_REG / 4] = SMI_CS_ENABLE | SMI_CS_START;
+
+    // 6. Set GPIO to ALT1 for SMI
+    hw->gpio[GPFSEL0] |= ((GPIO_FUNC_ALT1 << 24) | (GPIO_FUNC_ALT1 << 27));
 }
 
 void smi_stop_capture(SmiHardware* hw) {

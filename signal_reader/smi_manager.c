@@ -106,7 +106,7 @@ int smi_manager_init(uint32_t sample_rate) {
     uint32_t* configs = (uint32_t*)((uint8_t*)tx_cbs + (3 * sizeof(struct DmaControlBlock))); 
 
     // WRITE Mode: Enable(1) + Start(4) + Clear(8) + Write(16) = 0x1D
-    configs[0] = 0x1D; 
+    configs[0] = 0x39; 
     // READ Mode: Enable(1) + Start(4) + Clear(8) = 0x0D
     configs[1] = 0x0D; 
 
