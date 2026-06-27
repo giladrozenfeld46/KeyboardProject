@@ -27,8 +27,9 @@
 
 // SMI Control Bits
 #define SMI_CS_ENABLE        (1 << 0)
-#define SMI_CS_START         (1 << 3)  
-#define SMI_CS_CLEAR         (1 << 4)  
+#define SMI_CS_START         (1 << 2)
+#define SMI_CS_CLEAR         (1 << 3) 
+#define SMI_CS_WRITE         (1 << 4)  
 
 // SMI DMA Control Bits
 #define SMI_DMC_DMAEN        (1 << 28) 

@@ -57,7 +57,7 @@ int smi_manager_init(uint32_t sample_rate) {
         return -1;
     }
 
-    // 1. Allocate sample buffers (15 for RX, 1 for TX)
+    // 1. Allocate sample buffers (4 for RX, 1 for TX)
     for (int i = 0; i < NUM_BUFFERS; i++) {
         if (allocate_dma_buffer(&sample_bufs[i], BUFFER_BYTES) != 0) {
             printf("Failed to allocate sample buffer %d.\n", i);
