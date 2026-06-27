@@ -14,9 +14,9 @@
 // Configuration for multiple separate buffers
 #define BUFFER_SAMPLES       1024
 #define BUFFER_BYTES         (BUFFER_SAMPLES * 4)
-#define NUM_BUFFERS          16
-#define NUM_BUFFERS_RX       15 // Reserve the 16th buffer strictly for TX
-#define TX_BUFFER_INDEX      15
+#define NUM_BUFFERS          5
+#define NUM_BUFFERS_RX       4 // Reserve the 16th buffer strictly for TX
+#define TX_BUFFER_INDEX      5
 
 // Optimization: Number of samples to fetch in a single burst (must be a divisor of BUFFER_SAMPLES)
 #define CHUNK_SIZE           8
@@ -61,6 +61,9 @@ int smi_manager_init(uint32_t sample_rate) {
     for (int i = 0; i < NUM_BUFFERS; i++) {
         if (allocate_dma_buffer(&sample_bufs[i], BUFFER_BYTES) != 0) {
             printf("Failed to allocate sample buffer %d.\n", i);
+            for (int j = 0; j < i; j++) {
+                free_dma_buffer(&sample_bufs[j]);
+            }
             return -1;
         }
     }
@@ -68,12 +71,18 @@ int smi_manager_init(uint32_t sample_rate) {
     // 2. Allocate memory for RX Control Blocks
     if (allocate_dma_buffer(&cb_buf, sizeof(struct DmaControlBlock) * NUM_BUFFERS_RX) != 0) {
         printf("Failed to allocate RX control blocks.\n");
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            free_dma_buffer(&sample_bufs[i]);
+        }
         return -1;
     }
 
     // 2.5 Allocate memory for TX Control Blocks (3 CBs + 2 configuration words = 104 bytes -> padding to 128)
     if (allocate_dma_buffer(&tx_cb_buf, sizeof(struct DmaControlBlock) * 3 + 8) != 0) {
         printf("Failed to allocate TX control blocks.\n");
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            free_dma_buffer(&sample_bufs[i]);
+        }
         return -1;
     }
 
@@ -122,6 +131,9 @@ int smi_manager_init(uint32_t sample_rate) {
     dma_base = mmap(NULL, 4096, PROT_READ|PROT_WRITE, MAP_SHARED, mem_fd, 0xFE007000);
     if (dma_base == MAP_FAILED) {
         perror("Failed to mmap DMA");
+        for (int i = 0; i < NUM_BUFFERS; i++) {
+            free_dma_buffer(&sample_bufs[i]);
+        }
         return -1;
     }
 
