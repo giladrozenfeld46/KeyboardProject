@@ -43,6 +43,7 @@ static SmiHardware smi_hw;
 static volatile uint32_t *dma_base = NULL;
 static volatile uint32_t *dma_chan_rx = NULL; // Channel 5
 static volatile uint32_t *dma_chan_tx = NULL; // Channel 6
+static int mem_fd = -1; // FIXED: Global mem_fd declaration added
 
 // Direct SMI Registers mapping for Inlining
 static volatile uint32_t *smi_regs = NULL; 
@@ -118,12 +119,6 @@ int smi_manager_init(uint32_t target_rate_hz) {
     return 0;
 }
 
-/**
- * Attempts to read a chunk of 8 samples from the buffer using fast memory copying.
- * Expects an array of at least 8 uint32_t elements as out_samples.
- * Returns 0 if the chunk is not ready yet.
- * Returns 1 if 8 samples were successfully copied into out_samples.
- */
 int smi_manager_read_chunk(uint32_t *out_samples) {
     if (!out_samples) return 0;
 
@@ -163,7 +158,7 @@ void smi_manager_write_sequence(const uint8_t* gpio8_seq, const uint8_t* gpio9_s
 
     // Update payload length dynamically in the TX Control Block
     struct DmaControlBlock* tx_cbs = (struct DmaControlBlock*)tx_cb_buf.virtual_addr;
-    tx_cbs[0].length = length * sizeof(uint32_t);
+    tx_cbs[0].txfr_len = length * sizeof(uint32_t); // FIXED: Using txfr_len instead of length
 
     // 2. INLINE PAUSE RX DMA
     dma_chan_rx[0] &= ~1; 
@@ -191,16 +186,12 @@ void smi_manager_write_sequence(const uint8_t* gpio8_seq, const uint8_t* gpio9_s
     smi_regs[0] = SMI_CS_ENABLE | SMI_CS_START; // Read mode
 }
 
-/**
- * Stops the hardware, unmaps memory, and frees the allocated DMA buffers.
- */
 void smi_manager_cleanup() {
     printf("Stopping SMI and DMA hardware...\n");
     
-    if (dma_chan5) {
-        // HARD RESET: Instantly freeze the DMA channel
-        dma_chan5[0] = (1 << 31);
-    }
+    // FIXED: Updated to correctly reference the new channel pointers
+    if (dma_chan_rx) dma_chan_rx[0] = (1 << 31);
+    if (dma_chan_tx) dma_chan_tx[0] = (1 << 31);
     
     smi_stop_capture(&smi_hw);
     smi_cleanup(&smi_hw);
@@ -209,16 +200,20 @@ void smi_manager_cleanup() {
         munmap((void*)dma_base, 4096);
     }
     
+    // FIXED: Cleanup uses the globally declared mem_fd
     if (mem_fd >= 0) {
         close(mem_fd);
     }
     
-    // Free all scattered buffers
-    for (int i = 0; i < NUM_BUFFERS; i++) {
-        free_dma_buffer(&sample_bufs[i]);
+    // FIXED: Memory freeing logic updated for the separated RX and TX buffers
+    for (int i = 0; i < NUM_RX_BUFFERS; i++) {
+        free_dma_buffer(&rx_sample_bufs[i]);
     }
-    free_dma_buffer(&cb_buf);
+    free_dma_buffer(&tx_sample_buf);
+    free_dma_buffer(&dma_wakeup_buf);
+    
+    free_dma_buffer(&rx_cb_buf);
+    free_dma_buffer(&tx_cb_buf);
     
     printf("SMI Manager cleaned up successfully.\n");
 }
-
